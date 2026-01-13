@@ -45,19 +45,21 @@ The pipelines were used to generate the microbiome results reported in the assoc
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
+git clone https://github.com/lydiakirsche/urban-ethiopian-children-microbiome.git
 ```
 
 2. Open the desired `.Rmd` file in RStudio.
 3. Adjust file paths and parameters in the configuration sections.
 4. Execute the document to reproduce the analyses.
 
+---
+
 ## Cite
 
 If you use the data, or find this work useful, please cite:
 
 ### Gut microbial signatures expose the westernized lifestyle of urban Ethiopian children.
-Lydia Kirsche, Peter Leary, Martin J. Blaser, Michael Scharl, Adugna Negussie and Anne Müller
+*Lydia Kirsche, Peter Leary, Martin J. Blaser, Michael Scharl, Adugna Negussie and Anne Müller*
 
 The repository is archived on Zenodo with a DOI.
 
