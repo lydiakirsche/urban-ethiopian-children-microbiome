@@ -1,0 +1,3339 @@
+# Ethiopian Child Microbiome Analysis - Metagenomics Pipeline
+
+## Overview
+```{text}
+This pipeline processes shotgun metagenomics data through:
+1. Quality control and host contamination removal
+2. Metagenome assembly and binning
+3. Functional profiling with HUMAnN3
+4. Species-level genome bin (SGB) assignment
+5. Statistical analysis and visualisation
+
+```
+
+## System Requirements and Setup
+```{text}
+**NOTE:** This pipeline was designed for HPC environments with SLURM job scheduling.
+You will need to adapt the module loading and environment activation commands 
+for your specific system.
+
+**Required Software:**
+- FastQC
+- Bowtie2
+- samtools
+- metaSPAdes
+- MetaBAT2
+- CheckM
+- HUMAnN3 with MetaPhlAn
+- PhyloPhlAn
+- eggNOG-mapper
+- R with required packages (see Session Information at end)
+
+**UPDATE ALL PATHS BELOW FOR YOUR SYSTEM:**
+- Replace `/path/to/your/` placeholders with actual paths
+- Update module loading commands for your HPC environment
+- Update conda environment names as needed
+- Update SLURM parameters (#SBATCH directives) for your cluster
+```
+
+
+# Part 1: Reads, Host contamination, Assembly, Binning (submitting to slurm in batches)
+```{bash}
+# Define some file path variables 
+DIR=/path/to/your/metagenome_analysis  # UPDATE THIS PATH FOR YOUR SYSTEM
+
+# Create main result folders on first run
+if [[ ! -d $DIR/results ]]; then
+mkdir $DIR/results
+mkdir $DIR/results/fastqc
+mkdir $DIR/results/fastqc/raw
+mkdir $DIR/results/fastqc/host-removed
+mkdir $DIR/results/host-removed
+mkdir $DIR/results/assemblies
+fi
+
+# Assessing Read Quality
+FILE_COUNT=$(find $DIR/results/fastqc/raw -name "${1}_*_1_fastqc.html" | wc -l)
+if [[ "$FILE_COUNT" -gt 0 ]]; then
+  echo "Skipping initial FastQC"
+else
+  fastqc -t 2 -o $DIR/results/fastqc/raw $DIR/$(echo "YOUR_SEQUENCING_RUN_ID_0"$2)/RawData/$1/*.fq.gz
+fi
+
+# Remove host contamination using bowtie2
+# The minimum size in bytes (1GB) (so treat as suspicious if smaller)
+min_size=$((1*1024*1024*1024))
+# Get the size of the file
+file_size=$(stat -c%s "$DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz")
+
+if [[ ! -f $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz || $file_size -le $min_size ]]
+then
+  if [[ ! -d $DIR/results/host-removed/$1 ]]; then mkdir $DIR/results/host-removed/$1; fi
+  bowtie2 \
+    -p 8 \
+    -x $DIR/GRCh38_noalt_as/GRCh38_noalt_as \
+    -1 $(echo $DIR/"YOUR_SEQUENCING_RUN_ID_0"$2)/RawData/$1/"$1"*_1.fq.gz \
+    -2 $(echo $DIR/"YOUR_SEQUENCING_RUN_ID_0"$2)/RawData/$1/"$1"*_2.fq.gz \
+    --sensitive-local \
+    --un-conc-gz $DIR/results/host-removed/$1/"$1"_host_removed | samtools view -bS - > $DIR/results/host-removed/$1/"$1"_mapped_and_unmapped.bam
+  # Rename
+  mv $DIR/results/host-removed/$1/"$1"_host_removed.1 $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz
+  mv $DIR/results/host-removed/$1/"$1"_host_removed.2 $DIR/results/host-removed/$1/"$1"_host_removed.2.fastq.gz
+  # Check for quality again
+  fastqc -t 2 -o $DIR/results/fastqc/host-removed $DIR/results/host-removed/$1/*.gz
+fi
+
+# Metagenome Assembly using metaSPAdes
+# t = threads, k = k-mer sizes (odd, less than 128), m = RAM limit in Gb (default: 250)
+# If something crashed while running: there are continue pipeline options https://github.com/ablab/spades#sec1.3 
+if [[ ! -f $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta && -f $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz ]]
+then
+  if [[ -d $DIR/results/assemblies/$1 ]]; then rm -rf $DIR/results/assemblies/$1; fi
+  mkdir $DIR/results/assemblies/$1
+  metaspades.py \
+    -1 $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz \
+    -2 $DIR/results/host-removed/$1/"$1"_host_removed.2.fastq.gz \
+    -t 16 \
+    -m 640 \
+    -o $DIR/results/assemblies/$1/metaspades-autok/ \
+     --checkpoints all 
+  perl $DIR/metag-rev-sup/scripts/contig-stats.pl -i $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta > $DIR/results/assemblies/$1/metaspades-autok/contig-stats.txt
+  samtools faidx $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta
+fi
+
+# Binning of assemblies to MAGS
+# Fist, you need to map the reads to the contigs to create a BAM file as input for MetaBAT2
+# Build assembly database
+if [[ ! -f $DIR/results/assemblies/$1/metaspades-bowtie2-index/metaspades-autok.rev.1.bt2 && -f $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta ]]
+then
+  if [[ ! -d $DIR/results/assemblies/$1/metaspades-bowtie2-index ]]; then mkdir $DIR/results/assemblies/$1/metaspades-bowtie2-index; fi
+  bowtie2-build --threads 16 --seed 42 \
+    $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta \
+    $DIR/results/assemblies/$1/metaspades-bowtie2-index/metaspades-autok
+fi 
+
+# Map input reads to assembly
+if [[ ! -d $DIR/results/assemblies/$1/mapping ]]; then mkdir $DIR/results/assemblies/$1/mapping; fi
+if [[ ! -f $DIR/results/assemblies/$1/mapping/$1.metaspades.sorted.bam.bai && -f $DIR/results/assemblies/$1/metaspades-bowtie2-index/metaspades-autok.rev.1.bt2 && -f $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz ]]
+then
+  bowtie2 --sensitive-local -p 16 --seed 42 \
+    -x $DIR/results/assemblies/$1/metaspades-bowtie2-index/metaspades-autok \
+    -1 $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz \
+    -2 $DIR/results/host-removed/$1/"$1"_host_removed.2.fastq.gz | samtools view -bS - > $DIR/results/assemblies/$1/mapping/$1.metaspades.mapped.bam
+  # sort BAM file
+  samtools sort -@ 8 $DIR/results/assemblies/$1/mapping/$1.metaspades.mapped.bam -o $DIR/results/assemblies/$1/mapping/$1.metaspades.sorted.bam
+  # index BAM file
+  samtools index -@ 8 $DIR/results/assemblies/$1/mapping/$1.metaspades.sorted.bam
+  rm $DIR/results/assemblies/$1/mapping/$1.metaspades.mapped.bam
+fi
+
+# https://bitbucket.org/berkeleylab/metabat/src/master/
+# Hybrid binning: This method combines sequence composition-based and coverage-based binning to increase the accuracy of binning results.
+# Hierarchical clustering approach based on tetranucleotide frequency and coverage information
+if [[ ! -f $DIR/results/assemblies/$1/mapping/depth.txt && -f $DIR/results/assemblies/$1/mapping/$1.metaspades.sorted.bam.bai ]]
+then
+  jgi_summarize_bam_contig_depths \
+    --outputDepth $DIR/results/assemblies/$1/mapping/depth.txt $DIR/results/assemblies/$1/mapping/$1.metaspades.sorted.bam
+fi
+
+if [[ ! -f $DIR/results/assemblies/$1/metabat2/$1.1.fa && -f $DIR/results/assemblies/$1/mapping/depth.txt ]]
+then
+  if [[ ! -d $DIR/results/assemblies/$1/metabat2 ]]; then mkdir $DIR/results/assemblies/$1/metabat2; fi
+  metabat2 \
+    -i $DIR/results/assemblies/$1/metaspades-autok/scaffolds.fasta \
+    -a $DIR/results/assemblies/$1/mapping/depth.txt \
+    -o $DIR/results/assemblies/$1/metabat2/$1 \
+    -v \
+    --seed 42
+fi
+
+# Check quality of Bins with CheckM
+# https://github.com/Ecogenomics/CheckM/wiki
+if [[ ! -f $DIR/results/assemblies/$1/metabat2/CheckM.txt && -f $DIR/results/assemblies/$1/metabat2/$1.1.fa ]]
+then
+  if [[ ! -d $DIR/results/assemblies/$1/metabat2/CheckM ]]; then mkdir $DIR/results/assemblies/$1/metabat2/CheckM; fi
+  conda activate YOUR_CHECKM_ENV  # e.g., checkm_v1.2.1
+  checkm lineage_wf \
+    -t 16 \
+    -x fa \
+    -f $DIR/results/assemblies/$1/metabat2/CheckM.txt \
+    $DIR/results/assemblies/$1/metabat2 \
+    $DIR/results/assemblies/$1/metabat2/CheckM
+fi
+
+```
+
+## Part 1b: Contig stats (run manually in terminal, in case it did not work in the loop above)
+```{bash}
+# script contig-stats.pl from https://github.com/chrisquince/metag-rev-sup/tree/master 
+DIR=/path/to/your/metagenome_analysis  # UPDATE THIS PATH FOR YOUR SYSTEM
+
+# sample name is the 9th path element in this cluster layout; adjust if directory depth changes
+scaffold_files=()
+for file in $DIR/results/assemblies/*/metaspades-autok/scaffolds.fasta.fai; do 
+  sample=$(echo $file | awk -F "/" '{print $9}')
+  base=$(basename "${file}" .fai)
+  fasta_path=$(echo $DIR/results/assemblies/$sample/metaspades-autok/$base)
+  scaffold_files+=("${fasta_path}")
+done
+
+# mkdir $DIR/results/assemblies/contig-stats
+for file in $DIR/results/assemblies/*/metaspades-autok/scaffolds.fasta.fai
+do
+  sample=$(echo $file | awk -F "/" '{print $9}')
+  base=$(basename "${file}" .fai)
+  fasta_path=$(echo $DIR/results/assemblies/$sample/metaspades-autok/$base)
+  echo -ne $sample"\t" >> $DIR/results/assemblies/contig-stats.txt
+  echo $(perl /path/to/your/metag-rev-sup/scripts/contig-stats.pl  # UPDATE THIS PATH FOR YOUR SYSTEM 
+done
+
+multiqc -o $DIR/results/fastqc/ -n Raw -i Raw $DIR/results/fastqc/raw/*
+multiqc -o $DIR/results/fastqc/ -n Host-Removed -i Host-Removed $DIR/results/fastqc/host-removed/*
+```
+
+# Part 2: Humann3 Functional Profiling (submitting to slurm in batches)
+```{bash}
+# Define some file path variables 
+DIR=/path/to/your/metagenome_analysis  # UPDATE THIS PATH FOR YOUR SYSTEM
+
+if [[ ! -d $DIR/results/humann/$1 ]]; then
+mkdir $DIR/results/humann/$1
+fi
+
+# Concatenate host-removed reads
+if [[ ! -f $DIR/results/host-removed/$1/"$1"_host_removed.concat.fastq.gz  && -f $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz ]]
+then
+zcat $DIR/results/host-removed/$1/"$1"_host_removed.1.fastq.gz $DIR/results/host-removed/$1/"$1"_host_removed.2.fastq.gz | pigz -p 16 > $DIR/results/host-removed/$1/"$1"_host_removed.concat.fastq.gz
+fi
+
+if [[ ! -f $DIR/results/humann/$1/"$1"_genefamilies.tsv && -f $DIR/results/host-removed/$1/"$1"_host_removed.concat.fastq.gz ]]
+then
+humann \
+  --input $DIR/results/host-removed/$1/"$1"_host_removed.concat.fastq.gz \
+  --output $DIR/results/humann/$1 \
+  --output-basename $1 \
+  --threads 16 \
+  --verbose
+samtools view -bS $DIR/results/humann/$1/"$1"_humann_temp/"$1"_bowtie2_aligned.sam > $DIR/results/humann/$1/"$1"_humann_temp/"$1"_bowtie2_aligned.bam
+rm $DIR/results/humann/$1/"$1"_humann_temp/"$1"_bowtie2_aligned.sam
+rm -rf $DIR/results/humann/$1/"$1"_humann_temp/tmp*
+fi
+```
+
+
+# Part 3: Normalize Humann3 outputs to CPM and Rename KO tables (run manually in terminal)
+```{bash}
+DIR2=/path/to/your/metagenome_analysis/results/humann  # UPDATE THIS PATH FOR YOUR SYSTEM
+
+for f in $(ls $DIR2)
+do
+# Genes 
+humann_renorm_table \
+  --input $DIR2/$f/"$f"_genefamilies.tsv \
+  --output $DIR2/$f/"$f"_genefamilies_cpm.tsv \
+  --units cpm \
+  --update-snames 
+humann_regroup_table \
+  --input $DIR2/$f/"$f"_genefamilies_cpm.tsv \
+  --output $DIR2/$f/"$f"_ko_cpm.tsv \
+  --groups uniref90_ko
+humann_rename_table --input $DIR2/$f/"$f"_ko_cpm.tsv --output $DIR2/$f/"$f"_ko_cpm_named.tsv --names kegg-orthology
+  
+# Pathway abundances
+humann_renorm_table \
+  --input $DIR2/$f/"$f"_pathabundance.tsv \
+  --output $DIR2/$f/"$f"_pathabundance_cpm.tsv \
+  --units cpm \
+  --update-snames 
+
+done
+```
+
+# Part 4: Calculate SGBs from MAGs
+```{r}
+# Load required library
+library(fs)
+
+# Define paths
+base_path <- "/path/to/your/metagenome_analysis/results/assemblies"  # UPDATE THIS PATH FOR YOUR SYSTEM
+output_path <- file.path(base_path, "HQ_bins")
+
+# Create output directory if it doesn't exist
+if (!dir_exists(output_path)) {
+  dir_create(output_path)
+}
+
+# Get the list of sample directories in 'assemblies'
+sample_dirs <- dir_ls(base_path, type = "directory", recurse = FALSE)
+
+# Exclude specific folders
+# sample_dirs <- sample_dirs[!basename(sample_dirs) %in% c("metabat2", "HQ_bins", "Mock", "HQ_MQ_bins")]
+
+
+# Loop through each sample directory
+for (sample_dir in sample_dirs) {
+  metabat2_path <- file.path(sample_dir, "metabat2")
+  checkm_file <- file.path(metabat2_path, "CheckM.txt")
+  
+  # Check if the CheckM.txt file exists
+  if (file_exists(checkm_file)) {
+    # Read the CheckM.txt file
+    checkm_data <- read.delim(checkm_file, header = TRUE, stringsAsFactors = FALSE)
+    
+    # Filter the table based on Completeness and Contamination criteria
+    filtered_data <- subset(checkm_data, Completeness > 90 & Contamination < 5)
+    
+    # If there are rows passing the criteria
+    if (nrow(filtered_data) > 0) {
+      # Loop through each filtered bin
+      for (bin_id in filtered_data$`Bin.Id`) {
+        bin_file <- file.path(metabat2_path, paste0(bin_id, ".fa"))
+        
+        # Check if the bin file exists
+        if (file_exists(bin_file)) {
+          # Copy the bin file to the HQ_MQ_bins directory
+          destination <- file.path(output_path, paste0(basename(bin_file)))
+          file_copy(bin_file, destination)
+          message(sprintf("Copied %s to %s", bin_file, destination))
+        } else {
+          message(sprintf("Bin file %s not found in %s", paste0(bin_id, ".fa"), metabat2_path))
+        }
+      }
+    }
+  } else {
+    message(sprintf("CheckM.txt not found in %s", metabat2_path))
+  }
+}
+```
+
+```{bash}
+# Run PhyloPhlAn on the MAGs to assign them to SGBs
+# Use the database SGB Jun23 (newest) from the Segata lab 
+# a genome is assigned to the clostest SGB in case of it's genetic distance resulted below 5%. Otherwise, new SGB were defined by hierarchical clustering based on average linkage
+# n specifies the number of SGBs reported in the output (here just the one closest)
+
+phylophlan_assign_sgbs \
+    -i /path/to/your/phylophlan/HQ_bins \
+    -o /path/to/your/phylophlan/HQ_bins \
+    --nproc 20 \
+    -n 1 \
+    -d SGB.Jun23 \
+    --verbose 2>&1 | tee logs/phylophlan_sgb_assignment.log  # UPDATE: Name your log file
+
+```
+
+## Part 4b: eggNOG-mapper for functional annotation of MAGs
+```{bash}
+# Create a directory for the database:
+mkdir mnt/eggnog_mapper/data
+# Set the environment variable to point to the database directory (Tell eggNOG-mapper where to find/store the databases)
+export EGGNOG_DATA_DIR=/path/to/your/eggnog_mapper/data
+# Download the necessary database:
+download_eggnog_data.py
+
+# Here as a loop (RUN IN SCREEN):
+# Define directories
+INPUT_DIR="/path/to/your/eggnog_input"  # UPDATE THIS PATH FOR YOUR SYSTEM
+OUTPUT_DIR="/path/to/your/eggnog_output"  # UPDATE THIS PATH FOR YOUR SYSTEM
+LOG_FILE="/path/to/your/eggnog_mapper/eggnog_output/emapper_run.log"
+
+# Make sure output directory exists
+mkdir -p "$OUTPUT_DIR"
+
+# Create or clear log file
+echo "eggNOG-mapper batch run started at $(date)" > "$LOG_FILE"
+echo "------------------------------------------" >> "$LOG_FILE"
+
+# Loop over all .fa files
+for fasta_file in "$INPUT_DIR"/*.fa; do
+    # Extract filename without path and extension
+    base_name=$(basename "$fasta_file" .fa)
+    
+    echo "[$(date)] Starting $base_name..." | tee -a "$LOG_FILE"
+    
+    # Run eggNOG-mapper and capture exit code
+    emapper.py -m diamond --itype genome --genepred prodigal --cpu 26 --excel \
+      -i "$fasta_file" \
+      -o "$base_name" \
+      --output_dir "$OUTPUT_DIR"
+    
+    if [ $? -eq 0 ]; then
+        echo "[$(date)] Finished $base_name successfully." | tee -a "$LOG_FILE"
+    else
+        echo "[$(date)] ERROR running $base_name." | tee -a "$LOG_FILE"
+    fi
+done
+
+echo "------------------------------------------" >> "$LOG_FILE"
+echo "eggNOG-mapper batch run finished at $(date)" >> "$LOG_FILE"
+```
+
+# Part 5: Process HUMAnN3 outputs to relative abundance and rename to MetaCyc reactions
+```{bash}
+# MetaCyc
+# use relative abundance
+
+# --------------------------------------- Genefamilies ------------------------------------------------
+DIR2="/path/to/your/humann_genefamilies"  # UPDATE THIS PATH FOR YOUR SYSTEM
+LOGFILE="$DIR2/humann_processing.log"  # Define log file
+
+# Clear log file before starting
+echo "HUMAnN Processing Log - $(date)" > "$LOGFILE"
+
+for f in "$DIR2"/*.tsv  # Iterate over all .tsv files
+do
+  if [[ -f "$f" ]]; then  # Check if file exists (in case of empty directory)
+    filename=$(basename "$f" _genefamilies.tsv)  # Extract base name
+
+    echo "Processing sample: $filename" | tee -a "$LOGFILE"
+
+    # Run HUMAnN commands and log output
+    humann_renorm_table \
+      --input "$f" \
+      --output "$DIR2/${filename}_genefamilies_relab.tsv" \
+      --units relab \
+      --update-snames 2>&1 | tee -a "$LOGFILE"
+
+    humann_regroup_table \
+      --input "$DIR2/${filename}_genefamilies_relab.tsv" \
+      --output "$DIR2/${filename}_rxn_relab.tsv" \
+      --groups uniref90_rxn 2>&1 | tee -a "$LOGFILE"
+
+    humann_rename_table \
+      --input "$DIR2/${filename}_rxn_relab.tsv" \
+      --output "$DIR2/${filename}_rxn_relab_named.tsv" \
+      --names metacyc-rxn 2>&1 | tee -a "$LOGFILE"
+
+    echo "Finished processing $filename" | tee -a "$LOGFILE"
+    echo "------------------------------------------------" | tee -a "$LOGFILE"
+  else
+    echo "No .tsv files found in $DIR2. Exiting." | tee -a "$LOGFILE"
+    exit 1
+  fi
+done
+
+# Ok here we run into an issue. We have a high% of Unmapped and unintegrated genefamilies.
+# see here: https://forum.biobakery.org/t/compatibility-of-humann2-output-files-for-MaAsLin3/412/9
+# "I typically remove them from the pathways tables when doing abundance-weighted diversity analyses so that they don’t dominate the calculation."
+# However, they can be useful to retain for linear modeling as they limit the potential for housekeeping functions to artificially inflate in less-well-characterized communities.
+# so we make another version for the pathways wo the unmapped and unintegrated pathways
+
+# Genes
+DIR4="/path/to/your/humann_genefamilies_WOspecial"  # UPDATE THIS PATH FOR YOUR SYSTEM
+LOGFILE="$DIR4/humann_processing.log"  # Define log file
+
+# Clear log file before starting
+echo "HUMAnN Processing Log - $(date)" > "$LOGFILE"
+
+for f in "$DIR4"/*.tsv
+do
+  if [[ -f "$f" ]]; then
+    filename=$(basename "$f" _genefamilies.tsv)
+
+    echo "Processing sample: $filename" | tee -a "$LOGFILE"
+
+    # Run HUMAnN commands and log output
+    humann_renorm_table \
+      --input "$f" \
+      --output "$DIR4/${filename}_genefamilies_relab_WOspecial.tsv" \
+      --units relab \
+      --special n \
+      --update-snames 2>&1 | tee -a "$LOGFILE"
+
+    humann_regroup_table \
+      --input "$DIR4/${filename}_genefamilies_relab_WOspecial.tsv" \
+      --output "$DIR4/${filename}_rxn_relab_WOspecial.tsv" \
+      --ungrouped N \
+      --protected N \
+      --groups uniref90_rxn 2>&1 | tee -a "$LOGFILE"
+
+    humann_rename_table \
+      --input "$DIR4/${filename}_rxn_relab_WOspecial.tsv" \
+      --output "$DIR4/${filename}_rxn_relab_named_WOspecial.tsv" \
+      --names metacyc-rxn 2>&1 | tee -a "$LOGFILE"
+
+    echo "Finished processing $filename" | tee -a "$LOGFILE"
+    echo "------------------------------------------------" | tee -a "$LOGFILE"
+  else
+    echo "No .tsv files found in $DIR4. Exiting." | tee -a "$LOGFILE"
+    exit 1
+  fi
+done
+
+
+# --------------------------------------- Pathways ------------------------------------------------
+DIR3=/path/to/your/humann_pathwayabundance  # UPDATE THIS PATH FOR YOUR SYSTEM
+for f in "$DIR3"/*.tsv
+do
+  if [[ -f "$f" ]]; then
+    filename=$(basename "$f" _pathabundance.tsv)
+
+    humann_renorm_table \
+      --input "$f" \
+      --output "$DIR3/${filename}_pathabundance_relab.tsv" \
+      --units relab \
+      --update-snames
+  fi
+done
+
+# We also have a high % of Unmapped and unintegrated pathways.
+# so we make another version for the pathways wo the unmapped and unintegrated pathways
+# here is the explanation why they don't sum to 1: https://forum.biobakery.org/t/humann3-pathway-abundance-table-pathway-sum-and-species-sum-different/1471
+
+DIR3=/path/to/your/humann_pathwayabundance  # UPDATE THIS PATH FOR YOUR SYSTEM
+for f in "$DIR3"/*.tsv  # Iterate over all .tsv files in the directory
+do
+  if [[ -f "$f" ]]; then 
+    filename=$(basename "$f" _pathabundance.tsv)
+
+    humann_renorm_table \
+      --input "$f" \
+      --output "$DIR3/${filename}_pathabundance_relab_WOspecial.tsv" \
+      --units relab \
+      --special n \
+      --update-snames
+  fi
+done
+
+rm *.tsv_pathabundance_relab_WOspecial.tsv
+
+# Merge all samples
+# Genes without special
+find /path/to/your/data/ItalyHumann/humann_genefamilies_Italy_WOspecial -name '*_rxn_relab_named_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ \;
+find /path/to/your/humann_output/humann_genefamilies_LK_WOspecial -name '*_rxn_relab_named_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ \;
+find /path/to/your/data/SegataHumann/humann_genefamilies_Segata_WOspecial -name '*_rxn_relab_named_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ \;
+humann_join_tables -i /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ -o /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/Combined_Datasets_genefamilies_merged_rxn_relab_named_WOspecial.tsv
+
+find /path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ -type f ! -name 'Combined_Datasets_genefamilies_merged_rxn_relab_named_WOspecial.tsv' -delete
+scp -r your_username@your_server_ip:/path/to/your/data/ItalyHumann/CombinedDatasets/genefamilies/ /path/to/your/data/ITALY/humann
+
+# Pathway abundance without special
+find /path/to/your/data/ItalyHumann/humann_pathwayabundance_Italy -name '*_pathabundance_relab_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ \;
+find /path/to/your/humann_output/humann_pathwayabundance_LK -name '*_pathabundance_relab_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ \;
+find /path/to/your/data/SegataHumann/humann_pathwayabundance_Segata -name '*_pathabundance_relab_WOspecial.tsv' -type f -exec cp {} /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ \;
+humann_join_tables -i /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ -o /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/Combined_Datasets_pathwayabundance_relab_WOspecial.tsv
+
+find /path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ -type f ! -name 'Combined_Datasets_pathwayabundance_relab_WOspecial.tsv' -delete
+scp -r your_username@your_server_ip:/path/to/your/data/ItalyHumann/CombinedDatasets/pathwayabundance/ /path/to/your/data/ITALY/humann
+
+
+```
+
+# Part 6: Analysis in R
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(ggprism)
+library(data.table)
+library(reshape2)
+library(easyalluvial)
+library(gridExtra)
+library(cowplot)
+library(qiime2R)
+library(devtools)
+library(ggbeeswarm)
+library(ggpubr)
+library(ComplexHeatmap)
+library(vegan)
+library(DESeq2)
+library(ggrepel)
+library(rstatix)
+library(viridis)
+library(RColorBrewer)
+library(ggplot2)
+library(ggsci)
+library(Polychrome)
+library(ashr)
+library(circlize)
+library(tibble)
+library(treemap)
+library(dplyr)
+library(readr)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tidyverse)
+library(forcats)
+library(ggprism)
+library(ggrepel)
+library(broom)
+```
+
+## Part 6a: Analysis for First part of the study: Description Urban Ethiopian cohort
+```{r}
+# Import Metaphlan results 
+taxa.metaphlan <- read.csv("/path/to/your/data/MaAsLin_analysis/maaslin_merged_abundance_table_metaphlan.txt", sep = '\t', row.names = 1)
+
+# Import metadata
+metadata <- read.csv("/path/to/your/data/Metadata/250403_Adugna_metadata_filtered_metagenomics.txt", sep = '\t', row.names = 1)
+```
+
+### COG annotation
+```{r}
+## Input file paths
+
+# COG legend: mapping from one-letter codes (and special labels) to descriptions
+# obtained from here: https://www.sbg.bio.ic.ac.uk/~phunkee/html/old/COG_classes.html
+file_cog_legend <- "/path/to/your/data/HQ_WO_SGBdatabaseerror/eggNOG_analysis/COG_table.xlsx"
+# Bin metadata: includes Bin IDs, Teff_Freq_Factor_Binary, SGB, family etc.
+file_metadata   <- "/path/to/your/data/HQ_WO_SGBdatabaseerror/Whole_Tree_SGBd/Bins_with_metadata.xlsx"
+# Folder with eggNOG annotation files (copied from the server)
+annotation_folder <- "/path/to/your/data/HQ_WO_SGBdatabaseerror/eggnog_output/annotations"
+
+## Load data
+# 1. COG legend
+df_cog_legend <- read_excel(file_cog_legend)
+# 2. Bin metadata
+df_metadata <- read_excel(file_metadata)
+# 3. List all .annotations files
+annotation_files <- list.files(
+  annotation_folder,
+  pattern = "\\.annotations$",
+  full.names = TRUE
+)
+
+## Process annotation files into COG compositions per MAG
+# Function to process one annotation file -> one MAG's COG composition
+process_annotation <- function(file) {
+  # Extract bin/MAG name from filename
+  bin_name <- basename(file) %>%
+    str_remove("\\.emapper\\.annotations$")  # remove .emapper.annotations suffix if present
+  
+  # Load eggNOG annotation table, skipping "##" comment lines
+  df_annotations <- read_tsv(
+    file,
+    comment = "##",
+    show_col_types = FALSE
+  )
+  
+  # Summarise functional composition
+  df_cog_summary <- df_annotations %>%
+    select(`#query`, COG_category) %>%                 # keep query ID and COG category
+    filter(!is.na(COG_category)) %>%                   # drop rows without COG category
+    mutate(
+      COG_category_clean = case_when(
+        COG_category == "-" ~ "eggNOG hit without annotation",
+        nchar(COG_category) > 1 ~ "Multiple functional category",
+        TRUE ~ COG_category                                  # keep single letter codes
+      )
+    ) %>%
+    # Map single-letter (and special) categories to descriptive names
+    left_join(df_cog_legend,
+              by = c("COG_category_clean" = "one_letter")) %>%
+    mutate(
+      Final_Category = ifelse(
+        is.na(COG_description),
+        COG_category_clean,
+        COG_description
+      )
+    ) %>%
+    # Count how many genes per functional category
+    dplyr::count(Final_Category) %>%
+    # Convert to percentages per bin
+    mutate(
+      Percent = 100 * n / sum(n),
+      Bin     = bin_name
+    )
+  
+  return(df_cog_summary)
+}
+
+# Apply to all annotation files
+list_cog_compositions <- lapply(annotation_files, process_annotation)
+
+# Combine all MAGs into one big table
+df_all_cog_compositions <- bind_rows(list_cog_compositions)
+
+# Merge with metadata to get Teff_Freq_Factor_Binary, family, SGB, etc.
+df_plot <- df_all_cog_compositions %>%
+  left_join(df_metadata, by = c("Bin" = "Bin"))
+
+
+## COG barplot
+
+# Colour palette for COG categories
+my_colours <- c("#F0C33CFF", "#F0F03CFF", "#C3E13CFF", "thistle", "#4BA53CFF",
+                "#F0A569FF", "plum3", "seagreen",
+                "deeppink3", "#87693CFF", "#2D5A3CFF" , "#F03C2DFF", "maroon",
+                "#6699FFFF", "#3366CCFF", "#003399FF", "#99CC33FF", "#00CC00FF", "#669900FF",
+                "#FFCC00FF", "#FF9900FF", "#CC0000FF", "grey51", "#3C2D2DFF", "#785A5AFF")
+
+# Three “special” categories, to be placed last in the legend/order
+special_order <- c(
+  "eggNOG hit without annotation",
+  "Function unknown",
+  "Multiple functional category"
+)
+
+# Identify existing categories and build final ordered factor levels
+existing_categories <- df_plot %>%
+  pull(Final_Category) %>%
+  unique() %>%
+  na.omit() %>%
+  setdiff(special_order) %>%
+  sort()
+
+final_order <- c(existing_categories, special_order)  # special ones at the end/lowest
+
+# Reorder Final_Category using this final order
+df_plot <- df_plot %>%
+  mutate(Final_Category = factor(Final_Category,
+                                 levels  = final_order,
+                                 ordered = TRUE))
+
+# Create Bin_Grouped variable (Never/Ever prefix + Bin name)
+df_plot <- df_plot %>%
+  mutate(Bin_Grouped = paste(Teff_Freq_Factor_Binary, Bin, sep = "_"))
+
+# Sort bins within each Teff_Freq_Factor_Binary group by family, then Bin
+df_plot_never <- df_plot %>%
+  filter(Teff_Freq_Factor_Binary == "Never") %>%
+  arrange(family, Bin)
+
+df_plot_ever <- df_plot %>%
+  filter(Teff_Freq_Factor_Binary == "Ever") %>%
+  arrange(family, Bin)
+
+# Add a spacer between Never and Ever groups (empty bar)
+spacer_row <- df_plot %>%
+  slice(1) %>%
+  mutate(
+    Bin_Grouped   = "SPACER",
+    SGB           = "",             # no label
+    family        = "",             # no label
+    Final_Category = final_order[1],# any valid level (height 0 so it won't show)
+    Percent       = 0
+  )
+
+# Bind Never + Spacer + Ever
+df_plot_gap <- bind_rows(
+  df_plot_never,
+  spacer_row,
+  df_plot_ever
+)
+
+# Reset factor levels for Bin_Grouped according to this new order
+df_plot_gap <- df_plot_gap %>%
+  mutate(Bin_Grouped = factor(Bin_Grouped, levels = unique(Bin_Grouped)))
+
+# Reset Final_Category factor (important for stacking + legend order)
+df_plot_gap <- df_plot_gap %>%
+  mutate(Final_Category = factor(Final_Category, levels = final_order, ordered = TRUE))
+
+# Build nice x-axis labels: "Family, SGB"; empty for spacer
+x_labels <- df_plot_gap %>%
+  distinct(Bin_Grouped, family, SGB) %>%
+  arrange(Bin_Grouped) %>%
+  mutate(
+    family = ifelse(family == "Eubacteriales_Family_XIII_Incertae_Sedis",
+                    "Eubacteriales Family XIII",
+                    family),
+    label  = ifelse(Bin_Grouped == "SPACER", "",
+                    paste(family, SGB, sep = ", "))
+  ) %>%
+  pull(label)
+
+# Plot and save the COG composition barplot
+gx <- ggplot(df_plot_gap, aes(x = Bin_Grouped, y = Percent, fill = Final_Category)) +
+  geom_bar(stat = "identity") +
+  scale_x_discrete(labels = x_labels) +
+  scale_fill_manual(values = my_colours) +
+  scale_y_continuous(expand = c(0, 0)) +
+  guides(fill = guide_legend(ncol = 1)) +
+  theme_bw() +
+  theme_prism(base_size = 22) +
+  theme(
+    axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                    size = 24, face = "bold"),
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 24),
+    panel.spacing    = unit(1, "lines"),
+    legend.text      = element_text(size = 24),
+    legend.title     = element_text(size = 24),
+    plot.title       = element_text(hjust = 0.5, size = 22, face = "bold")
+  ) +
+  labs(
+    title = "Functional Composition per MAG",
+    x     = "MAGs annotated by Family, SGB",
+    y     = "Relative abundance (%)",
+    fill  = "COG Category"
+  )
+
+ggsave(
+  "/path/to/your/data/HQ_WO_SGBdatabaseerror/eggNOG_analysis/COG_Teff_Freq_Factor_Binary_ordered5_REVISION.pdf",
+  plot   = gx,
+  width  = 38,
+  height = 14,
+  dpi    = 300
+)
+
+## Statistics: Wilcoxon tests Never vs Ever per COG category
+## For each COG Final_Category, test Percent between Never vs Ever
+df_stats <- df_plot %>%
+  filter(Teff_Freq_Factor_Binary %in% c("Never", "Ever")) %>%
+  group_by(Final_Category) %>%
+  # keep only COGs present in both groups (at least one bin each)
+  filter(n_distinct(Teff_Freq_Factor_Binary) == 2) %>%
+  summarise(
+    p_value = wilcox.test(
+      Percent ~ Teff_Freq_Factor_Binary,
+      alternative = "two.sided"
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "fdr")  # FDR correction
+  )
+
+# (Optional) look at significant ones
+df_stats_sig <- df_stats %>%
+  filter(p_adj < 0.05) %>%
+  arrange(p_adj)
+
+## Volcano plot (log2FC with pseudocount)
+# Add pseudocount
+pseudocount <- max(1e-4, 0.5 * min(df_plot$Percent[df_plot$Percent > 0], na.rm = TRUE))
+
+# Recompute group medians and log2FC (Ever vs Never)
+df_effect_size_log2 <- df_plot %>%
+  filter(Teff_Freq_Factor_Binary %in% c("Never", "Ever")) %>%
+  group_by(Final_Category, Teff_Freq_Factor_Binary) %>%
+  summarise(
+    median_percent = median(Percent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from  = Teff_Freq_Factor_Binary,
+    values_from = median_percent
+  ) %>%
+  mutate(
+    log2_fc        = log2( (Ever + pseudocount) / (Never + pseudocount) ),
+    effect_size_abs = Ever - Never  # optional, not used in the plot
+  )
+
+# Merge with p_adj statistics and classify COGs
+df_volcano <- df_stats %>%
+  inner_join(df_effect_size_log2, by = "Final_Category") %>%
+  mutate(
+    log10_p_adj = -log10(p_adj),
+    Significance = case_when(
+      p_adj < 0.05 & log2_fc > 0  ~ "Sign. Up in Ever",
+      p_adj < 0.05 & log2_fc < 0  ~ "Sign. Up in Never",
+      TRUE                        ~ "Not Significant"
+    ),
+    Significance = factor(Significance,
+                          levels = c("Sign. Up in Never",
+                                     "Not Significant",
+                                     "Sign. Up in Ever"))
+  )
+
+significance_threshold <- 0.05
+
+# Volcano plot
+gp <- ggplot(df_volcano, aes(x = log2_fc, y = log10_p_adj)) +
+  geom_point(aes(colour = Significance), size = 6, alpha = 0.8) +
+  geom_label_repel(
+    data = filter(df_volcano, p_adj < significance_threshold),
+    aes(label = Final_Category, fill = Significance),
+    size         = 5.5,
+    show.legend  = FALSE,
+    colour        = "black",
+    box.padding  = 0.3,
+    point.padding = 0.3,
+    max.overlaps = 20,
+    direction    = "y",
+    nudge_y      = 0.5,
+    segment.colour = "black",
+    segment.size  = 0.2
+  ) +
+  scale_colour_manual(values = c(
+    "Sign. Up in Never" = "navyblue",
+    "Not Significant"   = "grey70",
+    "Sign. Up in Ever"  = "goldenrod2"
+  )) +
+  scale_fill_manual(values = c(
+    "Sign. Up in Never" = "#00008020",
+    "Not Significant"   = "lightgrey",
+    "Sign. Up in Ever"  = "#DAA52020"
+  )) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             colour = "grey60", size = 0.5) +
+  geom_hline(yintercept = -log10(significance_threshold),
+             linetype = "dashed", colour = "grey60", size = 0.5) +
+  theme_prism() +
+  labs(
+    x     = "log2FC",
+    y     = "-log10 (FDR-adjusted p-value)",
+    colour = NULL
+  ) +
+  theme(
+    legend.position   = "top",
+    legend.key.size   = unit(0.5, "cm"),
+    legend.text       = element_text(size = 16),
+    panel.grid.major  = element_line(colour = "grey90", size = 0.2),
+    panel.grid.minor  = element_blank(),
+    panel.background  = element_rect(fill = "white", colour = NA),
+    axis.title.x      = element_text(size = 16, face = "bold"),
+    axis.title.y      = element_text(size = 16, face = "bold"),
+    axis.text         = element_text(size = 16)
+  ) +
+  coord_cartesian(
+    xlim = c(-max(abs(df_volcano$log2_fc), na.rm = TRUE),
+              max(abs(df_volcano$log2_fc), na.rm = TRUE)),
+    ylim = c(0, max(df_volcano$log10_p_adj, na.rm = TRUE) + 0.2)
+  )
+
+ggsave(
+  "/path/to/your/data/HQ_WO_SGBdatabaseerror/eggNOG_analysis/Volcano_Plot_Teff_Freq_Factor_Binary_REVISION2.pdf",
+  plot   = gp,
+  width  = 7,
+  height = 7,
+  dpi    = 300
+)
+```
+
+### Teff Dough bacteria
+```{r}
+## Extract species-level table from metaphlan
+# Keep only rows that contain species (|s__)
+speciestable <- taxa.metaphlan[grep("\\|s__", rownames(taxa.metaphlan)), ]
+
+# Remove rows resolved further to strain level (|t__)
+speciestable_wostrain <- speciestable[grep("\\|t__", rownames(speciestable),
+                                           invert = TRUE), ]
+
+# Log-transform (log10 + 1)
+speciestable_wostrain <- log10(speciestable_wostrain + 1)
+
+## 2) Select only the “dough bacteria”
+dough_bacteria <- c(
+  "Lacticaseibacillus_paracasei",
+  "Lactiplantibacillus_xiangfangensis",
+  "Gluconobacter_oxydans",
+  "Fructilactobacillus_sanfranciscensis",
+  "Gluconobacter_cerinus",
+  "Gluconobacter_japonicus",
+  "Acetobacter_orientalis",
+  "Latilactobacillus_curvatus",
+  "Secundilactobacillus_silagei",
+  "Pediococcus_parvulus"
+)
+
+# Build pattern and filter by species name
+pattern <- paste(dough_bacteria, collapse = "|")
+
+speciestable_wostrain_dough <-
+  speciestable_wostrain[grepl(pattern,
+                               rownames(speciestable_wostrain)), ]
+
+## 3) Join with metadata and reshape for export
+# Keep only samples with Teff info
+metadata_filtered_Teff <- metadata[!is.na(metadata$Teff_Freq_Factor_Binary), ]
+# Add species column from rownames
+speciestable_wostrain_dough_df <-
+  speciestable_wostrain_dough %>%
+  rownames_to_column(var = "Species")
+# Wide (species x samples) -> long
+long_data <- speciestable_wostrain_dough_df %>%
+  pivot_longer(
+    cols      = -Species,
+    names_to  = "Sample",
+    values_to = "Abundance"
+  )
+# Attach metadata
+joined_data <- left_join(long_data, metadata_filtered_Teff, by = "Sample")
+# Short species names (remove taxonomic prefix)
+joined_data <- joined_data %>%
+  mutate(SpeciesShort = sub(".*s__", "", Species))
+
+
+## 4) Minimal Prism-ready table
+export_data <- joined_data %>%
+  select(SpeciesShort, Abundance, Teff_Freq_Factor_Binary)
+
+## 5) Write Excel
+write_xlsx(
+  export_data,
+  path = "/path/to/your/data/Dough bacteria/MinimalData_ForPrism.xlsx"
+)
+```
+
+### RGI Analysis Urban Ethiopian children
+```{r}
+## 1. Load & prepare RGI + metadata
+# Paths
+rgi_path      <- "/path/to/your/data/RGI/combined_amr_results.csv"
+metadata_path <- "/path/to/your/data/Metadata/250403_Adugna_metadata_filtered_metagenomics.xlsx"
+
+# Read RGI data
+# RGI data is created with CZ ID's AMR pipeline (https://czid.org/)
+rgi_data  <- read_csv(rgi_path)
+
+# Read metadata
+metadata  <- read_excel(metadata_path)
+
+# Filter RGI
+filtered_rgi <- rgi_data %>%
+  filter(num_reads >= 100, read_coverage_breadth >= 80)
+
+# Attach metadata
+annotated_rgi <- filtered_rgi %>%
+  left_join(metadata, by = c("sample_name" = "sample-id"))
+
+# (Maybe a little sanity check: which samples did NOT match metadata?)
+# anti_join(filtered_rgi, metadata, by = c("sample_name" = "sample-id"))
+
+## 2. Build df_count_lumped for alluvial plot
+# Number of top gene–mechanism–drug-class combinations to highlight
+top_n <- 10
+
+# Keep only the relevant columns
+df <- annotated_rgi %>%
+  select(gene_name, resistance_mechanism, high_level_drug_class)
+
+# Count each unique combination
+df_count <- df %>%
+  count(gene_name, resistance_mechanism, high_level_drug_class, sort = TRUE)
+
+# Identify top N most frequent combinations
+top_combos <- df_count %>%
+  slice_max(order_by = n, n = top_n)
+
+# Lump all combinations that are not in the top N into a single "Other" group
+df_count_lumped <- df_count %>%
+  mutate(
+    group = paste(gene_name, resistance_mechanism, high_level_drug_class, sep = "___"),
+    group = ifelse(
+      group %in% paste(top_combos$gene_name,
+                       top_combos$resistance_mechanism,
+                       top_combos$high_level_drug_class,
+                       sep = "___"),
+      group,
+      "Other___Other___Other"
+    )
+  ) %>%
+  separate(group,
+           into = c("gene_name", "resistance_mechanism", "high_level_drug_class"),
+           sep = "___") %>%
+  group_by(gene_name, resistance_mechanism, high_level_drug_class) %>%
+  summarise(n = sum(n), .groups = "drop")
+
+
+## 3. Alluvial plot
+# Start from df_count_lumped and lump infrequent categories in each axis to "Other"
+df_lumped <- df_count_lumped %>%
+  mutate(
+    gene_name = forcats::fct_lump_n(gene_name, n = top_n, other_level = "Other"),
+    resistance_mechanism = forcats::fct_lump_n(resistance_mechanism, n = top_n, other_level = "Other"),
+    high_level_drug_class = forcats::fct_lump_n(high_level_drug_class, n = top_n, other_level = "Other")
+  )
+
+# Manually impose specific order of levels (so that axes are nicely arranged)
+df_lumped <- df_lumped %>%
+  mutate(
+    gene_name = factor(gene_name, levels = c(
+      "Other",
+      "AAC(6')-Ii",
+      "Bifidobacterium adolescentis rpoB mutants conferring resistance to rifampicin",
+      "msrC",
+      "Bifidobacterium bifidum ileS conferring resistance to mupirocin",
+      "tet(Q)",
+      "tet(O)",
+      "dfrF",
+      "tet(40)",
+      "tet(M)",
+      "tet(W)"
+    )),
+    resistance_mechanism = factor(resistance_mechanism, levels = c(
+      "Other",
+      "antibiotic target alteration; antibiotic target replacement",
+      "antibiotic inactivation",
+      "antibiotic target protection",
+      "antibiotic target replacement",
+      "antibiotic efflux",
+      "antibiotic target alteration"
+    )),
+    high_level_drug_class = factor(high_level_drug_class, levels = c(
+      "Other",
+      "aminoglycoside antibiotic",
+      "tetracycline antibiotic",
+      "macrolide antibiotic; streptogramin antibiotic",
+      "mupirocin-like antibiotic",
+      "diaminopyrimidine antibiotic",
+      "rifamycin antibiotic"
+    ))
+  )
+
+# Expand rows according to n (easyalluvial expects one row per “observation”)
+df_expanded <- df_lumped %>%
+  tidyr::uncount(weights = n)
+
+# Base alluvial object
+p <- alluvial_wide(
+  data              = df_expanded,
+  max_variables     = 3,
+  stratum_width     = 0.4,
+  stratum_label_size = 0,    # we’ll add our own labels
+  col_vector_flow   = c(
+    "#4F6980FF", "#849DB1FF", "#A2CEAAFF", "#638B66FF", "#BFBB60FF",
+    "#F47942FF", "#FBB04EFF", "#B66353FF", "#D7CE9FFF", "#B9AA97FF", "#7E756DFF"
+  ),
+  fill_by           = "first_variable"
+)
+
+# Final figure with customised stratum labels and theme
+final_plot <- p +
+  geom_label(
+    stat  = "stratum",
+    aes(label = after_stat(stratum)),
+    fill  = "gray99",
+    colour = "black",
+    size  = 2.5,
+    fontface = "bold",
+    family = "sans",
+    label.size = 0.1
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "gene_name"             = "Gene",
+      "resistance_mechanism"  = "Resistance Mechanism",
+      "high_level_drug_class" = "Drug Class"
+    )
+  ) +
+  labs(
+    title = paste0("Top ", top_n, " AMR Gene-Mechanism-Drug Class Flows"),
+    y     = "Count",
+    x     = NULL
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    legend.position   = "bottom",
+    axis.text.x       = element_text(size = 12, face = "bold"),
+    plot.title        = element_text(size = 12, face = "bold", hjust = 0.5),
+    axis.text.y       = element_text(size = 12),
+    axis.title.y      = element_text(size = 12, face = "plain", family = "sans"),
+    panel.grid.major  = element_line(size = 0.6),
+    panel.grid.minor  = element_line(size = 0.3)
+  )
+
+# Save
+ggsave(
+  filename = "/path/to/your/data/RGI/amr_alluvial_plot2.pdf",
+  plot     = final_plot,
+  width    = 12,
+  height   = 5,
+  units    = "in"
+)
+
+
+## 4. AMR_stats_by_metadata.xlsx
+##    – global tests & summaries per metadata variable
+
+# Summarise AMR calls per sample
+amr_counts <- annotated_rgi %>%
+  group_by(sample_name) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  left_join(metadata, by = c("sample_name" = "sample-id"))
+
+# Variables to test
+vars <- c(
+  "Breast_18m_factor",
+  "Delivery_mode_factor",
+  "Latrine_in_room_factor",
+  "Age_Years",
+  "Teff_Freq_Factor_Binary",
+  "Home_room_factor",
+  "IgApos_bacteria_bin",
+  "HP_Result",
+  "family_size"
+)
+
+# Helper: treat non-numeric variables as factors
+coerce_group <- function(x) {
+  if (is.numeric(x)) x else factor(x)
+}
+
+# Function to run per-variable stats (global test + descriptive stats + pairwise if applicable)
+analyze_var <- function(df, var) {
+  d <- df %>%
+    select(sample_name, n_genes, !!sym(var)) %>%
+    rename(group = !!sym(var)) %>%
+    filter(!is.na(group))
+
+  if (nrow(d) == 0) {
+    return(list(
+      global  = tibble(variable = var, test = NA, n_groups = 0, n_samples = 0,
+                       statistic = NA, p_value = NA),
+      summary = tibble(variable = var, group = NA, n = NA, mean = NA,
+                       sd = NA, median = NA, IQR = NA),
+      pairwise = NULL
+    ))
+  }
+
+  g <- coerce_group(d$group)
+  d$group <- g
+
+  n_groups  <- if (is.numeric(g)) length(unique(g)) else nlevels(g)
+  n_samples <- nrow(d)
+
+  # Descriptive summary per group
+  summary_tbl <- d %>%
+    group_by(group) %>%
+    summarise(
+      n      = n(),
+      mean   = mean(n_genes),
+      sd     = sd(n_genes),
+      median = median(n_genes),
+      IQR    = IQR(n_genes),
+      .groups = "drop"
+    ) %>%
+    mutate(variable = var) %>%
+    relocate(variable)
+
+  # Choose appropriate test
+  if (is.numeric(g) || n_groups > 2) {
+    # Kruskal–Wallis for >2 groups (or numeric group)
+    kw <- suppressWarnings(kruskal.test(n_genes ~ as.factor(group), data = d))
+    global_tbl <- tibble(
+      variable  = var,
+      test      = "Kruskal–Wallis",
+      n_groups  = n_groups,
+      n_samples = n_samples,
+      statistic = unname(kw$statistic),
+      p_value   = kw$p.value
+    )
+
+    # Pairwise Wilcoxon (BH) if categorical with >2 groups
+    pw_tbl <- NULL
+    if (!is.numeric(g) && n_groups > 2) {
+      pw <- suppressWarnings(pairwise.wilcox.test(
+        d$n_genes, d$group,
+        p.adjust.method = "BH",
+        exact = FALSE
+      ))
+      pw_tbl <- as.data.frame(as.table(pw$p.value)) %>%
+        filter(!is.na(Freq)) %>%
+        rename(group1 = Var1, group2 = Var2, p_adj = Freq) %>%
+        mutate(variable = var, test = "Pairwise Wilcoxon (BH)") %>%
+        relocate(variable, test)
+    }
+
+  } else if (n_groups == 2) {
+    # Two groups --> Wilcoxon rank-sum
+    w <- suppressWarnings(wilcox.test(n_genes ~ group, data = d, exact = FALSE))
+    global_tbl <- tibble(
+      variable  = var,
+      test      = "Wilcoxon rank-sum",
+      n_groups  = n_groups,
+      n_samples = n_samples,
+      statistic = unname(w$statistic),
+      p_value   = w$p.value
+    )
+    pw_tbl <- NULL
+
+  } else {
+    global_tbl <- tibble(
+      variable  = var,
+      test      = NA,
+      n_groups  = n_groups,
+      n_samples = n_samples,
+      statistic = NA,
+      p_value   = NA
+    )
+    pw_tbl <- NULL
+  }
+
+  list(global = global_tbl, summary = summary_tbl, pairwise = pw_tbl)
+}
+
+# Run analysis for all variables
+res_list <- purrr::map(vars, ~ analyze_var(amr_counts, .x))
+
+# Global tests table (one row per variable)
+global_tests <- bind_rows(purrr::map(res_list, "global")) %>%
+  mutate(p_adj_BH_across_variables = p.adjust(p_value, method = "BH"))
+
+# Pairwise comparisons (if any variables generated them)
+pairwise_all <- bind_rows(purrr::map(res_list, "pairwise"))
+
+# Build Excel sheets
+sheets <- list(
+  AMR_counts   = amr_counts %>% select(sample_name, n_genes, all_of(vars)),
+  Global_tests = global_tests
+)
+
+# Add one sheet per variable with its pairwise table
+if (!is.null(pairwise_all) && nrow(pairwise_all) > 0) {
+  var_names_pw <- unique(pairwise_all$variable)
+  for (v in var_names_pw) {
+    sheets[[paste0("Pairwise_", v)]] <- pairwise_all %>%
+      filter(variable == v) %>%
+      select(-variable)
+  }
+}
+
+# Write Excel workbook
+out_xlsx <- "/path/to/your/data/RGI/AMR_stats_by_metadata.xlsx"
+write_xlsx(sheets, path = out_xlsx)
+
+cat("Wrote Excel workbook to:", out_xlsx, "\n")
+```
+
+
+
+## Part 6b: Urban vs Rural Ethiopian children
+#### MaasLin3 analysis - Species per Origin (+ Age)
+``` {r}
+# Keep only rows where row names contain 's__'
+taxa_table_filtered <- taxa_table[, grepl("s__", colnames(taxa_table)), drop = FALSE]
+# Excluded the ones resolved to strain level
+taxa_table_filtered <- taxa_table_filtered[, !grepl("t__", colnames(taxa_table_filtered)), drop = FALSE]
+
+# Remove rows with NA in Origin
+metadata_filtered <- metadata %>% filter(!is.na(Origin))
+
+# Keep only matching samples in pathway_table_filtered
+common_samples <- intersect(rownames(taxa_table_filtered), rownames(metadata_filtered))
+taxa_table_filtered <- taxa_table_filtered[common_samples, ]
+metadata_filtered <- metadata_filtered[common_samples, ]
+
+# Center Age to improve stability/interpretation
+metadata_filtered$Age_c <- scale(metadata_filtered$Age_Years, centre = TRUE, scale = FALSE)
+
+# Run Maaslin3
+set.seed(1)
+fit_out <- maaslin3(input_data = taxa_table_filtered,
+                    input_metadata = metadata_filtered,
+                    output = "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/250910_Origin",
+                    formula = ~ Origin + Age_c,
+                    cores = 1, 
+                    summary_plot_first_n = 40)
+
+```
+
+### Maaslin 3 results summary table
+
+```{r}
+# Load the MaAsLin3 results file
+maaslin_results <- read_tsv("/path/to/your/data/SEGATA/MaAsLin3_Segata/results/250910_Origin/significant_results.tsv")
+
+# Filter for significant results and "abundance" model only
+sig_results <- maaslin_results %>%
+  filter(qval_individual < 0.05, model == "abundance",
+         metadata == "Origin")
+
+# Extract genus and species from the full taxonomy string
+sig_results <- sig_results %>%
+  mutate(
+    genus = str_extract(feature, "g__[^\\.]+") %>% str_replace("g__", ""),
+    species = str_extract(feature, "s__[^\\.]+") %>% str_replace("s__", "")
+  )
+
+# Determine enrichment direction
+sig_results <- sig_results %>%
+  mutate(enriched_in = case_when(
+    value == "urban" & coef > 0 ~ "urban",
+    value == "urban" & coef < 0 ~ "rural",
+    value == "rural" & coef > 0 ~ "rural",
+    value == "rural" & coef < 0 ~ "urban",
+    TRUE ~ NA_character_
+  ))
+
+# Group and summarize species per genus and group
+summary_table <- sig_results %>%
+  group_by(genus, enriched_in) %>%
+  summarise(
+    species = paste(unique(species), collapse = ", "),
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = enriched_in,
+    values_from = c(count, species),
+    values_fill = list(count = 0, species = "")
+  )
+
+
+#### Short gt table
+# Summarise: count species per genus/group (no species names)
+genus_summary <- sig_results %>%
+  group_by(genus, enriched_in) %>%
+  summarise(
+    n_species = n_distinct(species),
+    .groups = "drop"
+  ) %>%
+  filter(n_species >= 2) %>%
+  mutate(enriched_in = factor(enriched_in, levels = c("urban", "rural"))) %>%
+  arrange(enriched_in, desc(n_species))
+
+genus_gt_table <- genus_summary %>%
+  gt() %>%
+  tab_header(
+    title = "Genus-Level Enrichment Summary",
+    subtitle = "Genera with ≥ 2 Significantly Enriched Species (q < 0.05)"
+  ) %>%
+  cols_label(
+    genus = "Genus",
+    enriched_in = "Enriched In",
+    n_species = "Number of Species"
+  ) %>%
+  tab_options(
+    table.font.size = "small",
+    data_row.padding = px(5),
+    column_labels.font.weight = "bold"
+  ) %>%
+  tab_style(
+    style = cell_text(font = "Arial", align = "left"),
+    locations = cells_body()
+  ) %>%
+  tab_style(
+    style = cell_text(colour = "#3C5488FF", weight = "bold"),
+    locations = cells_body(
+      columns = c(genus, enriched_in),
+      rows = enriched_in == "urban"
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(colour = "#00A087FF", weight = "bold"),
+    locations = cells_body(
+      columns = c(genus, enriched_in),
+      rows = enriched_in == "rural"
+    )
+  )
+
+
+# Save the table as a PDF
+# gtsave(data = genus_gt_table, filename = "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/genus_enrichment_summary_short_REVISION.pdf")
+```
+
+
+###Subsampling sensitivity analysis for Urban vs Rural 25 vs 6 100X
+
+```{r}
+# Assumes:
+# taxa_table_filtered  (samples x species; rownames are SampleIDs)
+# metadata (samples x metadata; rownames are SampleIDs)
+# And that Age_c is mean-centreed, Origin has levels incl. "urban" and "rural".
+
+# Focus on pairwise Urban vs Rural
+metadata <- read.csv("/path/to/your/data/SEGATA/MaAsLin3_Segata/250325_metadata_Adugna_Segata.txt", sep = '\t', row.names = 1)
+meta_UR <- metadata %>%
+  filter(Origin %in% c("urban", "rural")) %>%
+  droplevels()
+
+taxa_table <- read.csv("/path/to/your/data/SEGATA/MaAsLin3_Segata/transposed_Adugna_Segata_merged_metaphlan.txt", sep = '\t', row.names = 1)
+
+# Keep only columns (features) that are species-level ('s__'), and exclude those resolved to higher levels ('t__')
+taxa_table_filtered <- taxa_table[, grepl("s__", colnames(taxa_table)), drop = FALSE]
+taxa_table_filtered <- taxa_table_filtered[, !grepl("t__", colnames(taxa_table_filtered)), drop = FALSE]
+
+# Align samples between metadata and taxa table
+taxa_UR <- taxa_table_filtered[rownames(taxa_table_filtered) %in% rownames(meta_UR), , drop = FALSE]
+meta_UR  <- meta_UR[rownames(taxa_UR), , drop = FALSE] # align
+
+# Centre Age to improve stability/interpretation
+meta_UR$Age_c <- scale(meta_UR$Age_Years, centre = TRUE, scale = FALSE)
+
+# Set factor reference level
+meta_UR$Origin <- relevel(factor(meta_UR$Origin), ref = "urban")
+stopifnot(!anyNA(meta_UR$Age_c))
+
+# Sampling plan: 25 urban vs ALL rural (6) each iteration
+urban_ids <- rownames(meta_UR)[meta_UR$Origin == "urban"]
+rural_ids <- rownames(meta_UR)[meta_UR$Origin == "rural"]
+
+n_urban <- length(urban_ids)
+n_rural <- length(rural_ids)
+
+target_urban <- 25      # fixed number of urban per iteration
+target_rural <- n_rural # include all rural samples each iteration
+
+if (n_urban < target_urban) {
+  stop(sprintf("Need at least %d urban samples; found %d.", target_urban, n_urban))
+}
+if (n_rural < 1) stop("No rural samples found.")
+
+B <- 100
+out_root <- "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/subsample_sensitivity_UR_25vAll6_100x"
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+# Robust reader: try multiple filenames, wait for write, keep abundance+Origin only
+read_iter_results <- function(iter_dir, iter_id, verbose = FALSE) {
+  files_try <- c("all_results.tsv", "results.tsv", "significant_results.tsv")
+  found <- NULL
+  for (i in 1:50) {
+    for (f in files_try) {
+      if (file.exists(file.path(iter_dir, f))) { found <- f; break }
+    }
+    if (!is.null(found)) break
+    Sys.sleep(0.1)
+  }
+  if (is.null(found)) {
+    if (verbose) message("Iter ", iter_id, ": no results file found in ", iter_dir)
+    return(NULL)
+  }
+
+  df <- suppressMessages(read_tsv(file.path(iter_dir, found), show_col_types = FALSE))
+  required_cols <- c("model","metadata","feature","value","coef","qval_individual")
+  if (!all(required_cols %in% names(df))) {
+    if (verbose) message("Iter ", iter_id, ": results file lacks expected columns: ", found)
+    return(NULL)
+  }
+
+  # keep abundance + Origin; one row per feature×value
+  out <- df %>%
+    filter(model == "abundance", metadata == "Origin") %>%
+    distinct(feature, value, .keep_all = TRUE) %>%
+    transmute(iter = iter_id, feature, value, coef, qval_individual)
+
+  if (nrow(out) == 0 && verbose) {
+    message("Iter ", iter_id, ": abundance + Origin had 0 rows (file: ", found, ")")
+  }
+  out
+}
+
+# One iteration runner
+run_once_maaslin <- function(sample_ids, iter_id, out_root, verbose = FALSE) {
+  meta_sub <- meta_UR[sample_ids, , drop = FALSE]
+  taxa_sub <- taxa_UR[sample_ids, , drop = FALSE]
+
+  iter_dir <- file.path(out_root, sprintf("iter_%03d", iter_id))
+  dir.create(iter_dir, recursive = TRUE, showWarnings = FALSE)
+
+  invisible(
+    maaslin3(
+      input_data     = taxa_sub,
+      input_metadata = meta_sub,
+      output         = iter_dir,
+      formula        = ~ Origin + Age_c,
+      cores          = 1,
+      summary_plot_first_n = 0
+    )
+  )
+  read_iter_results(iter_dir, iter_id, verbose = verbose)
+}
+
+# Run the full set of iterations
+iter_list <- vector("list", B)
+for (b in seq_len(B)) {
+  ids <- c(sample(urban_ids, target_urban, replace = FALSE), rural_ids)  # resample urban; keep all rural
+  iter_list[[b]] <- tryCatch(run_once_maaslin(ids, b, out_root),
+                             error = function(e) { message("Iter ", b, " failed: ", e$message); NULL })
+  gc()
+}
+iter_results <- list_rbind(compact(iter_list))
+if (nrow(iter_results) == 0) stop("No iteration results produced (after robust read).")
+
+# Stability summary with constant denominator
+total_B <- B  # 100 iterations
+
+stab_summary <- iter_results %>%
+  group_by(feature, value) %>%
+  summarise(
+    n_runs        = n_distinct(iter),
+    n_signif      = sum(qval_individual < 0.05, na.rm = TRUE),
+    prop_signif   = n_signif / total_B,
+    prop_positive = mean(coef > 0, na.rm = TRUE),
+    median_coef   = median(coef, na.rm = TRUE),
+    median_q      = median(qval_individual, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    enriched_group = case_when(
+      value == "rural" & prop_positive > 0.5 ~ "rural",
+      value == "rural" & prop_positive < 0.5 ~ "urban",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    genus   = str_extract(feature, "g__[^;|]+") %>% str_replace("^g__", ""),
+    species = str_extract(feature, "s__[^;|]+") %>% str_replace("^s__", "") %>% str_replace_all("_", " ")
+  ) %>%
+  relocate(genus, species, .before = feature)
+
+# Save
+# write_tsv(stab_summary, file.path(out_root, "stability_summary.tsv"))
+
+# Apply stability criterion: ≥25% significant AND ≥75% direction consistency
+stab_summary <- stab_summary %>%
+  mutate(
+    stable = (prop_signif >= 0.25) & (prop_positive >= 0.75 | prop_positive <= 0.25),
+    direction_strict = case_when(
+      prop_positive >= 0.75 ~ "rural_enriched",  # coef > 0 in ≥75% runs (urban is reference)
+      prop_positive <= 0.25 ~ "urban_enriched",  # coef < 0 in ≥75% runs
+      TRUE ~ "mixed"
+    )
+  ) %>%
+  arrange(desc(stable), desc(prop_signif), desc(abs(median_coef)))
+
+# Save table
+write_tsv(filter(stab_summary, stable), file.path(out_root, "stable_taxa_25pct_sig_75pct_dir.tsv"))
+
+# Quick counts
+cat("Stable taxa:", sum(stab_summary$stable, na.rm = TRUE), "of", nrow(stab_summary), "\n")
+
+
+
+#### Plot of stable samples
+# paths
+maaslin_sig_path <- "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/250910_Origin/significant_results.tsv"
+stable_list_path <- "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/subsample_sensitivity_UR_25vAll6_100x/stable_taxa_25pct_sig_75pct_dir.tsv"
+out_pdf          <- "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/diverging_species_plot_OVERLAP_with_stable_REVISION.pdf"
+
+# read MaAsLin significant results (abundance ~ Origin only)
+sig_raw <- read_tsv(maaslin_sig_path, show_col_types = FALSE) %>%
+  filter(model == "abundance", metadata == "Origin") %>%
+  mutate(
+    qv = coalesce(qval_individual),
+    species = str_extract(feature, "s__[^;|]+") %>% str_remove("^s__") %>% str_replace_all("_", " ")
+  ) %>%
+  filter(qv < 0.05)
+
+if (nrow(sig_raw) == 0) {
+  stop("No significant rows found. Check q-value column names or input path.")
+}
+
+# If both 'urban' and 'rural' rows exist for the same species, keep the strongest |coef|
+sig <- sig_raw %>%
+  group_by(species) %>%
+  slice_max(order_by = abs(coef), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    effect_aligned = if_else(value == "urban", coef, -coef),   # >0 = Urban
+    enriched_label = if_else(effect_aligned > 0, "Urban", "Rural")
+  )
+
+# read the "stable" list (already filtered to stable taxa)
+stable_df <- read_tsv(stable_list_path, show_col_types = FALSE)
+
+# Try to join by (feature, value) first; if no overlap, fall back to feature-only
+overlap <- sig %>%
+  left_join(stable_df %>% select(feature, value) %>% mutate(is_stable_overlap = TRUE),
+            by = c("feature","value"))
+
+if (sum(coalesce(overlap$is_stable_overlap, FALSE)) == 0) {
+  overlap <- sig %>%
+    left_join(stable_df %>% select(feature) %>% mutate(is_stable_overlap = TRUE),
+              by = "feature")
+}
+
+plot_df <- overlap %>%
+  mutate(
+    is_stable_overlap = coalesce(is_stable_overlap, FALSE),
+    Stability = if_else(is_stable_overlap, "Stable overlap", "Not stable"),
+    species = factor(species)
+  ) %>%
+  arrange(effect_aligned) %>%
+  mutate(species = factor(species, levels = unique(species)))
+
+cat("Significant taxa total:", nrow(plot_df), "\n",
+    "Stable-overlap taxa:", sum(plot_df$is_stable_overlap), "\n")
+
+# plot
+# Keep only stable-overlap taxa for clarity
+# plot_df <- filter(plot_df, is_stable_overlap)
+
+p <- ggplot(plot_df, aes(x = effect_aligned, y = species)) +
+  geom_col(
+    aes(fill = enriched_label, alpha = Stability, colour = Stability),
+    width = 0.85, linewidth = 0.25
+  ) +
+  scale_fill_manual(values = c("Urban" = "#3C5488FF", "Rural" = "#00A087FF"),
+                    name = "Enriched in") +
+  scale_alpha_manual(values = c("Stable overlap" = 1.0, "Not stable" = 0.5),
+                     name = "Stability (overlap)") +
+  scale_colour_manual(values = c("Stable overlap" = "black", "Not stable" = "black"),
+                      guide = "none") +
+  labs(
+    x = "Effect size (ß-coefficient)",
+    y = NULL,
+    title    = "Species Abundance (Urban vs. Rural)",
+    subtitle = "Significant MaAsLin taxa (q < 0.05); stable-overlap from subsampling analysis highlighted"
+  ) +
+  theme_prism(base_size = 8) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle   = element_text(hjust = 0.5, size = 8),
+    axis.title.x    = element_text(face = "bold", size = 9),
+    axis.text.y     = element_text(size = 8, face = "bold.italic"),
+    legend.position = "top",
+    legend.title    = element_text(size = 8),
+    legend.text     = element_text(size = 8),
+    panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.3),
+    panel.grid.major.x = element_line(colour = "grey85", linewidth = 0.3),
+    legend.key.size    = unit(0.45, "cm"),
+    legend.spacing.x   = unit(0.15, "cm")
+  )
+
+p
+
+p <- ggplot(plot_df, aes(x = effect_aligned, y = species)) +
+  geom_col(
+    aes(fill = enriched_label, alpha = Stability, colour = Stability),
+    width = 0.85, linewidth = 0.25
+  ) +
+  scale_fill_manual(values = c("Urban" = "#3C5488FF", "Rural" = "#00A087FF"),
+                    name = "Enriched in") +
+  scale_alpha_manual(values = c("Stable overlap" = 1.0, "Not stable" = 0.5),
+                     name = "Stability (overlap)") +
+  scale_colour_manual(values = c("Stable overlap" = "black", "Not stable" = "black"),
+                      guide = "none") +
+  labs(
+    x = "Effect size (ß-coefficient)",
+    y = NULL,
+    title    = "Species Abundance (Urban vs. Rural)",
+    subtitle = "Significant MaAsLin3 taxa (q < 0.05)"
+  ) +
+  theme_prism(base_size = 8) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 11),
+    plot.subtitle   = element_text(hjust = 0.5, size = 8),
+    axis.title.x    = element_text(face = "bold", size = 9),
+    axis.text.y     = element_text(size = 8, face = "bold.italic"),
+    legend.position = "top",
+    legend.title    = element_text(size = 8),
+    legend.text     = element_text(size = 8),
+    panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.3),
+    panel.grid.major.x = element_line(colour = "grey85", linewidth = 0.3),
+    legend.key.size    = unit(0.45, "cm"),
+    legend.spacing.x   = unit(0.15, "cm")
+  ) +
+  guides(
+    alpha = guide_legend(order = 2),  # show Stability first
+    fill  = guide_legend(order = 1)   # then Enriched in
+  )
+
+p
+
+p <- p +
+  guides(
+    fill  = guide_legend(order = 1, nrow = 1, byrow = TRUE),  # Enriched in (top row)
+    alpha = guide_legend(order = 2, nrow = 1, byrow = TRUE)   # Stability (second row)
+  ) +
+  theme(
+    legend.position      = "top",
+    legend.box           = "vertical",     # stack the two guides
+    legend.justification = "centre",       # centre the whole legend box
+    legend.box.just      = "centre",       # (works on newer ggplot2)
+    legend.spacing.y     = unit(0.1, "cm")
+  )
+
+p
+
+p <- p +
+  scale_alpha_manual(
+    name   = "Stability status",
+    values = c("Stable overlap" = 1.0, "Not stable" = 0.3),
+    breaks = c("Stable overlap", "Not stable"),
+    labels = c("Robust", "Not robust")
+  ) +
+  guides(
+    fill  = guide_legend(order = 1, nrow = 1, byrow = TRUE),
+    alpha = guide_legend(order = 2, nrow = 1, byrow = TRUE)
+  ) +
+  theme(
+    legend.position      = "top",
+    legend.box           = "vertical",
+    legend.justification = "centre",
+    legend.spacing.y     = unit(0.1, "cm")
+  )
+
+p
+
+# save PDF
+ggsave(filename = out_pdf, plot = p, width = 6, height = 5.5, units = "in")
+
+# Export plot data to Excel
+library(writexl)
+
+# Prepare export table
+export_df <- plot_df %>%
+  mutate(
+    Robustness = if_else(Stability == "Stable overlap", "Robust", "Not robust")
+  ) %>%
+  select(
+    species, feature, metadata, value, coef, qv,
+    effect_aligned, enriched_label,
+    Stability = Robustness
+  )
+
+# Path to Excel file
+out_xlsx <- "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/diverging_species_plot_values_REVISION.xlsx"
+
+# Write Excel
+write_xlsx(export_df, out_xlsx)
+```
+
+
+
+### HUMAaN Pathways Origin (community level) (+ Age)
+``` {r}
+# Read pathway table
+pathway_table <- read.csv("/path/to/your/data/SEGATA/humann/pathwayabundance/Segata_Adugna_pathwayabundance_relab_WOspecial.tsv", sep = '\t', row.names = 1)
+
+# filter for community level
+pathway_table_filtered <- pathway_table %>% filter(!grepl("\\|", rownames(pathway_table)))
+
+# Remove "_*" from column names
+colnames(pathway_table_filtered) <- gsub("_.*$", "", colnames(pathway_table_filtered))
+
+# (Optional but recommended) centre Age to improve stability/interpretation
+metadata$Age_c <- scale(metadata$Age_Years, centre = TRUE, scale = FALSE)
+
+#Run MaAsLin3
+set.seed(1)
+fit_out <- maaslin3(input_data = pathway_table_filtered,
+                    input_metadata = metadata,
+                    output = "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/250923_Origin_pathway",
+                    formula =  ~ Origin + Age_c,
+                    cores = 1, 
+                    summary_plot_first_n = 185)
+
+```
+
+```{r fig.width=8, fig.height=12}
+# Load data, Top and bottom 15 were selected manually in excel from Maaslin3 (significant_results.tsv) results
+df <- read.delim("/path/to/your/data/SEGATA/MaAsLin3_Segata/results/ForPAPER plots/TopandBottom15_Origin.txt", check.names = FALSE, stringsAsFactors = FALSE)
+
+# Prepare data
+df <- df %>%
+  mutate(
+    lower = coef - stderr,
+    upper = coef + stderr,
+    log10_fdr = -log10(qval_individual),
+    feature_label = str_wrap(feature, width = 40)  # wrap long names
+  )
+
+# Sort entire data from highest to lowest coef
+df_sorted <- df %>% arrange(desc(coef))
+
+# Split top and bottom halves
+n <- 15
+top_half <- df_sorted %>% filter(coef > 0) %>% slice(1:n)
+bottom_half <- df_sorted %>% filter(coef < 0) %>% slice(1:n)
+
+
+# Add separator and group labels
+separator <- data.frame(
+  coef = NA, stderr = NA, qval_individual = NA,
+  lower = NA, upper = NA, log10_fdr = NA,
+  feature_label = "         ", stringsAsFactors = FALSE
+)
+
+# Combine in correct order
+df_plot <- bind_rows(
+  top_half,
+  separator,
+  bottom_half
+) %>%
+  mutate(
+    feature_label = factor(feature_label, levels = rev(unique(feature_label)))
+  )
+
+# Plot
+ g2 <- ggplot(df_plot, aes(x = coef, y = feature_label)) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, colour = "grey50", na.rm = TRUE) +
+  geom_point(
+    aes(fill = qval_individual),
+    size = 4, shape = 21, stroke = 0.6, colour = "black", na.rm = TRUE
+  ) +
+  scale_fill_gradientn(
+    colours = c("purple4", "plum2", "lightgrey"),
+    values = rescale(c(1e-10, 0.5, 1)),
+    name = expression("Abundance  " * P[FDR]),
+    trans = "log10",
+    guide = guide_colourbar(barwidth = 1, barheight = 10)
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(
+    x = "ß-coefficient",
+    y = " "
+  ) +
+  theme_prism(base_size = 12, border = TRUE) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.3), 
+    legend.title = element_text(size = 11, face = "bold")
+  )
+
+ ggsave(g2, filename = "/path/to/your/data/SEGATA/MaAsLin3_Segata/results/ForPAPER plots/TopandBottom15_Origin2.pdf", width = 8, height = 12, units = "in")
+
+```
+
+### Prevotella/Bacteroides Ratio (Genus level)
+```{r}
+# Extract genus names from rownames
+genus_names <- gsub(".*\\|g__", "", rownames(genustable))
+
+# Group rows by genus name and sum abundances (because we had one error (doublet) in Candidatus_Cibionibacter)
+genustable_merged <- rowsum(genustable, group = genus_names)
+
+# Make sure both genera exist
+stopifnot(all(c("Prevotella", "Bacteroides") %in% rownames(genustable_merged)))
+
+# Create ratio dataframe
+ratio_df <- data.frame(
+  Sample = colnames(genustable_merged),
+  Prevotella = as.numeric(genustable_merged["Prevotella", ]),
+  Bacteroides = as.numeric(genustable_merged["Bacteroides", ])
+) %>%
+  mutate(Ratio = (Prevotella + 1e-6) / (Bacteroides + 1e-6)) # Avoid division by zero
+
+# Add metadata
+ratio_df$Origin <- metadata$Origin[match(ratio_df$Sample, metadata$Sample)]
+
+# write_xlsx(ratio_df, path = "/path/to/your/data/Health_ratios/Prevotella_Bacteroides_Ratio.xlsx")
+
+ggplot(ratio_df, aes(x = Origin, y = Ratio, fill = Origin)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.7) +
+  scale_fill_manual(values = c("rural"= "#00A087FF", "urban" = "#3C5488FF")) +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Prevotella/Bacteroides Ratio",
+    y = "Ratio (log10 scale)",
+    x = "Origin"
+  ) +
+  theme_minimal(base_size = 14) +
+  stat_compare_means(method = "wilcox.test", label = "p.format")
+```
+
+### Firmicutes/Bacteroidota Ratio (Phylum level)
+```{r}
+# Extract genus names from rownames
+phylum_names <- gsub(".*\\|p__", "", rownames(phylumtable))
+
+# Group rows by phylum name and sum abundances  (because we had one error (doublet) in Candidatus_Cibionibacter)
+phylumtable_merged <- rowsum(phylumtable, group = phylum_names)
+
+# Make sure both genera exist
+stopifnot(all(c("Firmicutes", "Bacteroidota") %in% rownames(phylumtable_merged)))
+
+# Create ratio dataframe
+ratio_df <- data.frame(
+  Sample = colnames(phylumtable_merged),
+  Firmicutes = as.numeric(phylumtable_merged["Firmicutes", ]),
+  Bacteroidota = as.numeric(phylumtable_merged["Bacteroidota", ])
+) %>%
+  mutate(Ratio = (Firmicutes + 1e-6) / (Bacteroidota + 1e-6)) # Avoid division by zero
+
+# Add metadata
+ratio_df$Origin <- metadata$Origin[match(ratio_df$Sample, metadata$Sample)]
+
+ # write_xlsx(ratio_df, path = "/path/to/your/data/Health_ratios/Firmicutes_Bacteroidota_Ratio.xlsx")
+
+ggplot(ratio_df, aes(x = Origin, y = Ratio, fill = Origin)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.7) +
+  scale_fill_manual(values = c("rural"= "#00A087FF", "urban" = "#3C5488FF")) +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Firmicutes/Bacteroidota Ratio",
+    y = "Ratio (log10 scale)",
+    x = "Origin"
+  ) +
+  theme_minimal(base_size = 14) +
+  stat_compare_means(method = "wilcox.test", label = "p.format")
+```
+
+### Humann Pathways
+```{r eval = F}
+# Make a PCL file 
+humann_pathwayabund_merged <- read_tsv("/path/to/your/data/SEGATA/humann/pathwayabundance/Segata_Adugna_pathwayabundance_relab_WOspecial.tsv")
+pcl <- humann_pathwayabund_merged
+colnames(pcl)[[1]] <- paste("FEATURE \ SAMPLE")
+colnames(pcl) <- colnames(pcl) %>% gsub("_Abundance-RELAB", "", .)
+head(pcl)
+metadata2 <- metadata
+rownames(metadata2) <- metadata2$Sample
+metadata2 <- metadata2[colnames(pcl)[2:ncol(pcl)],]
+table(colnames(pcl)[2:ncol(pcl)] == metadata2$Sample)
+pcl <- rbind(pcl, c("Origin", metadata2$Origin))
+pcl <- rbind(pcl, c("Teff", metadata2$Teff_Freq_Factor_Binary))
+pcl <- rbind(pcl, c("Age", metadata2$Age_Years))
+# Identify metadata rows (last N rows that were added)
+metadata_rows <- pcl[(nrow(pcl) - 3 + 1):nrow(pcl), ] 
+feature_rows <- pcl[1:(nrow(pcl) - 3), ]
+
+# Combine, placing metadata at the top
+pcl2 <- rbind(metadata_rows, feature_rows)
+
+colnames(pcl2)[1] <- "FEATURE \\ SAMPLE"
+write_tsv(pcl2, "/path/to/your/data/SEGATA/humann/pathwayabundance/pathwayabund_merged.pcl", col_names = T, escape = "backslash", quote = "none")
+```
+
+
+```{bash eval = F}
+# Make a custom colourmap, in this case a .txt file with the matching colours humann_custom_colourmap.txt
+
+P=GLUCUROCAT-PWY
+S=Origin
+humann_barplot --input /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/pathwayabund_merged.pcl  --last-metadata Age --focal-metadata $S --focal-feature $P --sort sum metadata --scaling original --meta-colourmap humann_custom_colourmap.txt --output /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/$P-colour.png 
+
+P=P124-PWY
+S=Origin
+humann_barplot --input /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/pathwayabund_merged.pcl  --last-metadata Age --focal-metadata $S --focal-feature $P --sort sum metadata --scaling original --meta-colourmap humann_custom_colourmap.txt --output /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/$P-colour.png 
+
+P=LACTOSECAT-PWY
+S=Origin
+humann_barplot --input /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/pathwayabund_merged.pcl  --last-metadata Age --focal-metadata $S --focal-feature $P --sort sum metadata --scaling original --meta-colourmap humann_custom_colourmap.txt --output /path/to/your/data/SegataHumann/AdugnaSegata/pathwayabundance/$P-colour.png 
+
+```
+
+## Part 6c: Urban Ethiopian vs Rural Ethiopian vs Italian Children
+### Data import: MetaPhlAn, metadata, HUMAnN pathways
+```{r}
+# Paths (edit if needed)
+metaphlan_path <- "/path/to/your/data/ITALY/MaAsLin3_ITALY/Adugna_Segata_ITALY_merged_metaphlan.txt"
+metadata_path  <- "/path/to/your/data/ITALY/MaAsLin3_ITALY/250410_metadata_Adugna_Segata_Italy.txt"
+pathways_path  <- "/path/to/your/data/ITALY/humann/pathwayabundance/Combined_Datasets_pathwayabundance_relab_WOspecial.tsv"
+
+# MetaPhlAn table
+# rows = taxa, columns = samples
+
+taxa.metaphlan <- read.csv(
+metaphlan_path,
+sep         = "\t",
+row.names   = 1,
+check.names = FALSE
+)
+
+# Metadata
+metadata <- read.csv(
+metadata_path,
+sep         = "\t",
+row.names   = 1,
+check.names = FALSE
+)
+metadata$Sample <- rownames(metadata)
+
+# Make key covariates factors (adapt if needed)
+metadata$Age_Years        <- as.factor(metadata$Age_Years)
+metadata$family_size      <- as.factor(metadata$family_size)
+metadata$home_room        <- as.factor(metadata$home_room)
+metadata$Origin           <- as.factor(metadata$Origin)
+
+# HUMAnN pathways (relab)
+humann_pathways_relab <- read.csv(
+pathways_path,
+sep         = "\t",
+row.names   = 1,
+check.names = FALSE
+)
+
+```
+
+### MetaPhlAn prep, genus & species tables (shared)
+```{r}
+# Genus-level table (no species rows)
+genustable <- taxa.metaphlan[grep("\|g__", rownames(taxa.metaphlan)), ]
+genustable <- genustable[grep("\|s__", rownames(genustable), invert = TRUE), ]
+
+# Species-level table (no strain rows)
+speciestable <- taxa.metaphlan[grep("\|s__", rownames(taxa.metaphlan)), , drop = FALSE]
+speciestable <- speciestable[grep("\|t__", rownames(speciestable), invert = TRUE), , drop = FALSE]
+
+```
+
+### HUMAnN pathways: community level + metadata alignment
+```{r}
+# HUMAnN pathways: community level + metadata alignment
+# Keep only community-level pathways (no stratified entries with "|")
+humann_pathways_relab_filtered <- humann_pathways_relab %>%
+dplyr::filter(!grepl("\|", rownames(humann_pathways_relab)))
+
+# Clean sample names (HUMAnN relab)
+colnames(humann_pathways_relab_filtered) <- colnames(humann_pathways_relab_filtered) %>%
+gsub("_Abundance-RELAB", "", .) %>%
+gsub("_Abundance.RELAB", "", .)
+
+# Change to plain numeric matrix
+humann_pathways_df <- as.data.frame(as.matrix(humann_pathways_relab_filtered))
+
+# Align metadata order to HUMAnN samples
+metadata_humann <- metadata[colnames(humann_pathways_df), ]
+stopifnot(all(colnames(humann_pathways_df) == metadata_humann$Sample))
+rownames(metadata_humann) <- metadata_humann$Sample
+```
+
+### Pathways: top 30 per Origin by mean RA + Excel export
+```{r}
+# Pathways – Top 30 per Origin by mean RA + Excel export
+# Cohorts = Origin groups
+cohort_levels <- unique(metadata_humann$Origin)
+
+# Mean RA per pathway in each Origin group
+mean_per_cohort <- sapply(cohort_levels, function(origin) {
+samples_in_cohort <- rownames(metadata_humann)[metadata_humann$Origin == origin]
+rowMeans(humann_pathways_df[, samples_in_cohort, drop = FALSE], na.rm = TRUE)
+})
+
+# Keep pathways with mean RA > 1e-5 in at least one Origin
+keep_pathways <- apply(mean_per_cohort, 1, function(x) any(x > 1e-5))
+filtered_df   <- humann_pathways_df[keep_pathways, ]
+
+# For each cohort: top 30 pathways by mean abundance
+top_pathways_list <- lapply(cohort_levels, function(origin) {
+samples_in_cohort <- rownames(metadata_humann)[metadata_humann$Origin == origin]
+mean_abundances   <- rowMeans(filtered_df[, samples_in_cohort, drop = FALSE], na.rm = TRUE)
+names(sort(mean_abundances, decreasing = TRUE))[1:30]
+})
+
+top_pathways      <- unique(unlist(top_pathways_list))
+heatmap_input_df  <- filtered_df[top_pathways, ]
+
+# Excel export
+heatmap_input_export <- heatmap_input_df %>%
+as.data.frame() %>%
+rownames_to_column("Pathway")
+
+write_xlsx(
+heatmap_input_export,
+path = "/path/to/your/data/ITALY/REVISION_FS4e.xlsx"
+)
+```
+
+### Pathways Top30 Mean heatmap
+```{r}
+# Pathways_Top30_Mean_heatmap.pdf
+# Align metadata to columns of heatmap matrix
+metadata_hm <- metadata_humann[match(colnames(heatmap_input_df), metadata_humann$Sample), ]
+stopifnot(all(colnames(heatmap_input_df) == metadata_hm$Sample))
+
+# Column annotation
+topAnno <- HeatmapAnnotation(
+"Origin"        = metadata_hm$Origin,
+"Setting"       = metadata_hm$Setting,
+"Age (Years)"   = metadata_hm$Age_Years,
+"Delivery mode" = metadata_hm$Delivery_mode_factor,
+"Teff"          = metadata_hm$Teff_Freq_Factor_Binary,
+col = list(
+"Origin" = c(
+"Ethiopia_urban" = "#3C5488FF",
+"Ethiopia_rural" = "#00A087FF",
+"Italy"          = "#E64B35FF"
+),
+"Setting" = c("rural" = "tan4", "urban" = "turquoise3")
+),
+annotation_name_gp = gpar(fontsize = 13),
+gp                 = gpar(col = "white", lwd = 0.1),
+annotation_legend_param = list(
+title_gp  = gpar(fontsize = 12, fontface = "bold"),
+labels_gp = gpar(fontsize = 12)
+)
+)
+
+# Row annotation: pathway names
+row_anno <- rowAnnotation(
+Pathway = anno_text(rownames(heatmap_input_df),
+gp = gpar(fontsize = 13))
+)
+
+pdf("/path/to/your/data/ITALY/Pathways_Top30_Mean_heatmap.pdf",
+width = 20, height = 10)
+
+hm1 <- Heatmap(
+matrix              = heatmap_input_df,
+show_row_names      = FALSE,
+show_column_names   = FALSE,
+top_annotation      = topAnno,
+name                = "RA",
+col                 = mako(100),
+column_title        = "Top 30 Pathways per Cohort by Mean Abundance",
+column_split        = metadata_hm$Origin,
+cluster_rows        = TRUE,
+cluster_columns     = TRUE,
+heatmap_legend_param = list(
+labels_gp = gpar(fontsize = 12),
+title_gp  = gpar(fontsize = 12, fontface = "bold")
+)
+)
+
+draw(hm1 + row_anno,
+merge_legend           = TRUE,
+annotation_legend_side = "bottom",
+heatmap_legend_side    = "bottom")
+
+dev.off()
+
+```
+
+### Metaphlan heatmaps
+#### Genus prep: top 15% mean RA & top 20 per Origin (MetaPhlAn heatmaps)
+```{r}
+# Genus prep: Top 15% mean RA & Top 20 per Origin
+# Top 15% mean RA (filterGenusTo = 0.15)
+filterGenusTo <- 0.15
+genustablefiltered     <- genustable[which(rowMeans(genustable) > filterGenusTo), ]
+genustablefilteredlog  <- log10(genustablefiltered + 1)
+
+# Sorted version for heatmap
+genustablefilteredlog_sorted <- genustablefilteredlog[
+order(rowMeans(genustablefilteredlog), decreasing = TRUE),
+]
+
+# Names/phyla/families for Top15 heatmap
+genusnames  <- rownames(genustablefilteredlog_sorted) %>% gsub(".*g__", "", .)
+genusPhylum <- rownames(genustablefilteredlog_sorted) %>%
+gsub("\|c.*", "", .) %>%
+gsub(".*\|p__", "", .)
+genusFamily <- rownames(genustablefilteredlog_sorted) %>%
+gsub("\|g.*", "", .) %>%
+gsub(".*\|f__", "", .)
+
+# Top 20 genera per Origin, then union
+sample_origin <- metadata[colnames(genustable), "Origin"]
+origin_levels <- unique(sample_origin)
+
+group_means <- sapply(origin_levels, function(origin) {
+samples_in_group <- which(sample_origin == origin)
+rowMeans(genustable[, samples_in_group, drop = FALSE])
+})
+
+top_genera_list <- lapply(origin_levels, function(origin) {
+samples_in_group <- which(sample_origin == origin)
+gm <- rowMeans(genustable[, samples_in_group, drop = FALSE])
+names(sort(gm, decreasing = TRUE))[1:20]
+})
+names(top_genera_list) <- origin_levels
+
+top_genera_union <- unique(unlist(top_genera_list))
+
+genustablefiltered3    <- genustable[top_genera_union, ]
+genustablefiltered3log <- log10(genustablefiltered3 + 1)
+genustablefiltered3log_sorted <- genustablefiltered3log[
+order(rowMeans(genustablefiltered3log), decreasing = TRUE),
+]
+
+# Names/phyla/families for Top20-of-Origin heatmap
+
+genusnames3  <- rownames(genustablefiltered3log_sorted) %>% gsub(".*g__", "", .)
+genusPhylum3 <- rownames(genustablefiltered3log_sorted) %>%
+gsub("\|c.*", "", .) %>%
+gsub(".*\|p__", "", .)
+genusFamily3 <- rownames(genustablefiltered3log_sorted) %>%
+gsub("\|g.*", "", .) %>%
+gsub(".*\|f__", "", .)
+
+```
+
+#### Metaphlan top 15% heatmap (+Excel export)
+```{r}
+genustable_top15_export <- genustablefilteredlog_sorted %>%
+as.data.frame() %>%
+rownames_to_column("Genus")
+
+write_xlsx(
+genustable_top15_export,
+path = "/path/to/your/data/ITALY/FS4b_Top15percent_Genus_log10.xlsx"
+)
+
+# ---- Align metadata to columns ----
+
+metadata_genus <- metadata[match(colnames(genustablefilteredlog_sorted), metadata$Sample), ]
+stopifnot(all(colnames(genustablefilteredlog_sorted) == metadata_genus$Sample))
+
+# ---- Column annotation ----
+
+topAnno_genus <- HeatmapAnnotation(
+"Origin"        = metadata_genus$Origin,
+"Setting"       = metadata_genus$Setting,
+"Age (Years)"   = metadata_genus$Age_Years,
+"Delivery mode" = metadata_genus$Delivery_mode_factor,
+"Teff"          = metadata_genus$Teff_Freq_Factor_Binary,
+col = list(
+"Origin" = c(
+"Ethiopia_urban" = "#3C5488FF",
+"Ethiopia_rural" = "#00A087FF",
+"Italy"          = "#E64B35FF"
+),
+"Setting" = c("rural" = "tan4", "urban" = "turquoise3")
+),
+annotation_name_gp = gpar(fontsize = 13),
+gp                 = gpar(col = "white", lwd = 0.1),
+annotation_legend_param = list(
+title_gp  = gpar(fontsize = 12, fontface = "bold"),
+labels_gp = gpar(fontsize = 12)
+)
+)
+
+# ---- Row annotations (Phylum/Family/Genus text) ----
+
+manyCols <- c(
+"#DC050C", "#FB8072", "#1965B0", "#7BAFDE", "#882E72", "#B17BA6",
+"#FF7F00", "#FDB462", "#E7298A", "#E78AC3", "#33A02C", "#B2DF8A",
+"#55A1B1", "#8DD3C7", "#A6761D", "#E6AB02", "#7570B3", "#BEAED4",
+"#666666", "#999999", "#aa8282", "#d4b7b7", "#8600bf", "#ba5ce3",
+"#808000", "#aeae5c", "#1e90ff", "#00bfff", "#56ff0d", "#cfbf11",
+"#A9A9A9", "#FFD700", "#B22222", "#20B2AA", "#9370DB", "#3CB371",
+"#FF69B4", "#CD5C5C", "#6495ED", "#FF8C00"
+)
+
+generaPhylaCols <- RColorBrewer::brewer.pal(length(unique(genusPhylum)), "Dark2")
+names(generaPhylaCols) <- unique(genusPhylum)
+
+families <- sort(unique(genusFamily))
+generaFamilyCols <- manyCols[1:length(families)]
+names(generaFamilyCols) <- families
+
+leftAnno <- rowAnnotation(
+"Phylum" = genusPhylum,
+"Family" = genusFamily,
+col = list(
+"Phylum" = generaPhylaCols,
+"Family" = generaFamilyCols
+)
+)
+
+rightAnno <- rowAnnotation(
+"Genus" = anno_text(as.character(genusnames),
+gp = gpar(fontsize = 13, fontface = "plain", col = "black"))
+)
+
+pdf("/path/to/your/data/ITALY/Metaphlan_Top15percent_heatmap.pdf",
+width = 20, height = 14)
+
+hm1 <- Heatmap(
+matrix            = genustablefilteredlog_sorted,
+show_row_names    = FALSE,
+show_column_names = FALSE,
+left_annotation   = leftAnno,
+right_annotation  = rightAnno,
+top_annotation    = topAnno_genus,
+name              = "RA log10",
+col               = mako(100),
+column_title      = paste0("Genera >", filterGenusTo * 100, "% Mean Abundance"),
+column_split      = 9,
+cluster_rows      = FALSE,
+heatmap_legend_param = list(
+labels_gp = gpar(fontsize = 12),
+title_gp  = gpar(fontsize = 12, fontface = "bold")
+)
+) %>%
+draw(merge_legend = FALSE,
+heatmap_legend_side    = "left",
+annotation_legend_side = "bottom")
+
+dev.off()
+
+```
+
+#### Metaphlan top 20 per Origin heatmap (+Excel export)
+```{r}
+# Metaphlan_top20ofOrigin_heatmap.pdf
+genustable_top20_export <- genustablefiltered3log_sorted %>%
+as.data.frame() %>%
+rownames_to_column("Genus")
+
+write_xlsx(
+genustable_top20_export,
+path = "/path/to/your/data/ITALY/FS4c_Top20perOrigin_Genus_log10.xlsx"
+)
+
+# Align metadata
+
+metadata_genus3 <- metadata[match(colnames(genustablefiltered3log_sorted), metadata$Sample), ]
+stopifnot(all(colnames(genustablefiltered3log_sorted) == metadata_genus3$Sample))
+
+# Column annotation
+
+topAnno3 <- HeatmapAnnotation(
+"Origin"        = metadata_genus3$Origin,
+"Setting"       = metadata_genus3$Setting,
+"Age (Years)"   = metadata_genus3$Age_Years,
+"Delivery mode" = metadata_genus3$Delivery_mode_factor,
+"Teff"          = metadata_genus3$Teff_Freq_Factor_Binary,
+col = list(
+"Origin" = c(
+"Ethiopia_urban" = "#3C5488FF",
+"Ethiopia_rural" = "#00A087FF",
+"Italy"          = "#E64B35FF"
+),
+"Setting" = c("rural" = "tan4", "urban" = "turquoise3")
+),
+annotation_name_gp = gpar(fontsize = 13),
+gp                 = gpar(col = "white", lwd = 0.1),
+annotation_legend_param = list(
+title_gp  = gpar(fontsize = 12, fontface = "bold"),
+labels_gp = gpar(fontsize = 12)
+)
+)
+
+# Row annotations
+manyCols <- c(
+"#DC050C", "#FB8072", "#1965B0", "#7BAFDE", "#882E72", "#B17BA6",
+"#FF7F00", "#FDB462", "#E7298A", "#E78AC3", "#33A02C", "#B2DF8A",
+"#55A1B1", "#8DD3C7", "#A6761D", "#E6AB02", "#7570B3", "#BEAED4",
+"#666666", "#999999", "#aa8282", "#d4b7b7", "#8600bf", "#ba5ce3",
+"#808000", "#aeae5c", "#1e90ff", "#00bfff", "#56ff0d", "#cfbf11",
+"#A9A9A9", "#FFD700", "#B22222", "#20B2AA", "#9370DB", "#3CB371",
+"#FF69B4", "#CD5C5C", "#6495ED", "#FF8C00"
+)
+
+generaPhylaCols3 <- RColorBrewer::brewer.pal(length(unique(genusPhylum3)), "Dark2")
+names(generaPhylaCols3) <- unique(genusPhylum3)
+
+families3 <- sort(unique(genusFamily3))
+generaFamilyCols3 <- manyCols[1:length(families3)]
+names(generaFamilyCols3) <- families3
+
+leftAnno3 <- rowAnnotation(
+"Phylum" = genusPhylum3,
+"Family" = genusFamily3,
+col = list(
+"Phylum" = generaPhylaCols3,
+"Family" = generaFamilyCols3
+)
+)
+
+rightAnno3 <- rowAnnotation(
+"Genus" = anno_text(as.character(genusnames3),
+gp = gpar(fontsize = 13, fontface = "plain", col = "black"))
+)
+
+pdf("/path/to/your/data/ITALY/Metaphlan_top20ofOrigin_heatmap.pdf",
+width = 20, height = 12)
+
+hm1 <- Heatmap(
+matrix            = genustablefiltered3log_sorted,
+show_row_names    = FALSE,
+show_column_names = FALSE,
+left_annotation   = leftAnno3,
+right_annotation  = rightAnno3,
+top_annotation    = topAnno3,
+name              = "RA log10",
+col               = mako(100),
+column_title      = "Top 20 RA Genera of Each Origin Group",
+column_split      = 9,
+cluster_rows      = FALSE,
+heatmap_legend_param = list(
+labels_gp = gpar(fontsize = 12),
+title_gp  = gpar(fontsize = 12, fontface = "bold")
+)
+) %>%
+draw(merge_legend = FALSE,
+heatmap_legend_side    = "left",
+annotation_legend_side = "bottom")
+
+dev.off()
+
+```
+
+### Pathogens Barplot (+ Excel export)
+```{r}
+# Pathogens-Barplot.pdf + Pathogens_by_Origin.xlsx
+
+# List of target pathogens
+pathogen_species <- c(
+"Campylobacter_jejuni",
+"Campylobacter_coli",
+"Campylobacter_concisus",
+"Salmonella_enterica",
+"Shigella_flexneri",
+"Shigella_sonnei",
+"Escherichia_coli",
+"Clostridioides_difficile",
+"Clostridium_perfringens",
+"Yersinia_enterocolitica",
+"Vibrio_cholerae",
+"Klebsiella_pneumoniae",
+"Enterococcus_faecalis",
+"Enterococcus_faecium",
+"Bacteroides_fragilis",
+"Serratia_marcescens",
+"Helicobacter_pylori"
+)
+
+# Subset species-table to those species
+pathogen_patterns <- paste0("s__(", paste(pathogen_species, collapse = "|"), ")$")
+keep_rows <- grepl(pathogen_patterns, rownames(speciestable))
+pathogen_table <- speciestable[keep_rows, , drop = FALSE]
+
+# Clean rownames to Genus_species
+clean_species <- function(x) gsub(".*\|s__", "", x)
+rownames(pathogen_table) <- clean_species(rownames(pathogen_table))
+
+# Long format + metadata
+long_pathogens <- as.data.frame(pathogen_table) %>%
+rownames_to_column("Species") %>%
+pivot_longer(-Species, names_to = "Sample", values_to = "Abundance") %>%
+mutate(Sample = as.character(Sample))
+
+metadata_no_dup <- metadata
+rownames(metadata_no_dup) <- metadata_no_dup$Sample
+
+long_pathogens <- long_pathogens %>%
+dplyr::filter(Sample %in% rownames(metadata_no_dup)) %>%
+left_join(
+metadata_no_dup %>% dplyr::select(-Sample) %>% rownames_to_column("Sample"),
+by = "Sample"
+)
+
+# Prevalence and mean abundance per Origin & Species
+prev_thresh <- 0
+by_origin <- long_pathogens %>%
+group_by(Origin, Species) %>%
+summarise(
+n              = dplyr::n(),
+prevalence     = mean(Abundance > prev_thresh, na.rm = TRUE),
+mean_abundance = mean(Abundance, na.rm = TRUE),
+.groups        = "drop"
+) %>%
+arrange(Origin, desc(prevalence), desc(mean_abundance))
+
+# Excel export
+
+write_xlsx(
+by_origin,
+path = "/path/to/your/data/ITALY/Pathogens_by_Origin.xlsx"
+)
+
+# Barplot PDF
+pdf("/path/to/your/data/ITALY/Pathogens-Barplot.pdf",
+width = 6, height = 6)
+
+p_prev_by_origin <- ggplot(
+by_origin,
+aes(x = reorder(Species, prevalence),
+y = prevalence,
+fill = Origin)
+) +
+geom_col() +
+coord_flip() +
+facet_wrap(~ Origin, ncol = 1, scales = "free_y") +
+scale_y_continuous(
+labels = percent_format(accuracy = 1),
+breaks = seq(0, 1, 0.25),
+limits = c(0, 1.08),
+expand = c(0, 0)
+) +
+scale_fill_manual(
+values = c(
+"Ethiopia_urban" = "#3C5488",
+"Ethiopia_rural" = "#00A087",
+"Italy"          = "#E64B35"
+)
+) +
+labs(
+title = "Pathogen prevalence by Origin",
+x     = NULL,
+y     = "Prevalence"
+) +
+theme_prism(base_size = 10) +
+theme(
+legend.position      = "none",
+panel.grid.major.y   = element_line(colour = "grey80", linewidth = 0.3),
+panel.grid.minor     = element_blank(),
+strip.text           = element_text(size = 12, face = "bold"),
+axis.text.y          = element_text(face = "bold.italic")
+) +
+geom_hline(
+yintercept = c(0.25, 0.50, 0.75, 1.00),
+linetype   = "dashed",
+colour      = "grey70",
+linewidth  = 0.3
+)
+
+print(p_prev_by_origin)
+dev.off()
+
+```
+
+### Treponema (+ Excel export)
+```{r}
+# Treponema.pdf + Treponema_by_Origin.xlsx
+treponema_species <- c(
+"Treponema_berlinense",
+"Treponema_peruense",
+"Treponema_succinifaciens"
+)
+
+trep_patterns   <- paste0("s__(", paste(treponema_species, collapse = "|"), ")$")
+keep_rows_trep  <- grepl(trep_patterns, rownames(speciestable))
+trep_table      <- speciestable[keep_rows_trep, , drop = FALSE]
+
+clean_species <- function(x) gsub(".*\|s__", "", x)
+rownames(trep_table) <- clean_species(rownames(trep_table))
+
+# Long format + metadata
+long_trep <- as.data.frame(trep_table) %>%
+rownames_to_column("Species") %>%
+pivot_longer(-Species, names_to = "Sample", values_to = "Abundance") %>%
+mutate(Sample = as.character(Sample))
+
+metadata_no_dup <- metadata
+rownames(metadata_no_dup) <- metadata_no_dup$Sample
+
+long_trep <- long_trep %>%
+dplyr::filter(Sample %in% rownames(metadata_no_dup)) %>%
+left_join(
+metadata_no_dup %>% dplyr::select(-Sample) %>% rownames_to_column("Sample"),
+by = "Sample"
+)
+
+# Prevalence per Origin & Species
+prev_thresh <- 0
+by_origin_trep <- long_trep %>%
+group_by(Origin, Species) %>%
+summarise(
+n              = dplyr::n(),
+prevalence     = mean(Abundance > prev_thresh, na.rm = TRUE),
+mean_abundance = mean(Abundance, na.rm = TRUE),
+.groups        = "drop"
+) %>%
+arrange(Origin, desc(prevalence), desc(mean_abundance))
+
+# Excel export
+write_xlsx(
+by_origin_trep,
+path = "/path/to/your/data/ITALY/Treponema_by_Origin.xlsx"
+)
+
+# Barplot
+
+pdf("/path/to/your/data/ITALY/Treponema.pdf",
+width = 6, height = 3)
+
+p_prev_by_origin <- ggplot(
+by_origin_trep,
+aes(x = reorder(Species, prevalence),
+y = prevalence,
+fill = Origin)
+) +
+geom_col() +
+coord_flip() +
+facet_wrap(~ Origin, ncol = 1, scales = "free_y") +
+scale_y_continuous(
+labels = percent_format(accuracy = 1),
+breaks = seq(0, 1, 0.25),
+limits = c(0, 1.08),
+expand = c(0, 0)
+) +
+scale_fill_manual(
+values = c(
+"Ethiopia_urban" = "#3C5488",
+"Ethiopia_rural" = "#00A087",
+"Italy"          = "#E64B35"
+)
+) +
+labs(
+title = "Treponema prevalence by Origin",
+x     = NULL,
+y     = "Prevalence"
+) +
+theme_prism(base_size = 10) +
+theme(
+legend.position      = "none",
+panel.grid.major.y   = element_line(colour = "grey80", linewidth = 0.3),
+panel.grid.minor     = element_blank(),
+strip.text           = element_text(size = 12, face = "bold"),
+axis.text.y          = element_text(face = "bold.italic")
+) +
+geom_hline(
+yintercept = c(0.25, 0.50, 0.75, 1.00),
+linetype   = "dashed",
+colour      = "grey70",
+linewidth  = 0.3
+)
+
+print(p_prev_by_origin)
+dev.off()
+
+```
+
+### NMDS plots (+Excel export)
+#### Pathways
+```{r}
+# NMDS on HUMAnN pathway table (Bray–Curtis)
+# PERMANOVA on Batch
+
+# Load metadata and pathway table
+metadata <- read.csv(
+"/path/to/your/data/ITALY/MaAsLin3_ITALY/250410_metadata_Adugna_Segata_Italy.txt",
+sep       = "\t",
+row.names = 1,
+check.names = FALSE
+)
+
+pathway_table <- read.csv(
+"/path/to/your/data/ITALY/humann/pathwayabundance/Combined_Datasets_pathwayabundance_relab_WOspecial.tsv",
+sep       = "\t",
+row.names = 1,
+check.names = FALSE
+)
+
+# Keep only community-level pathways (no stratified entries with "|")
+pathway_table_filtered <- pathway_table %>%
+dplyr::filter(!grepl("\|", rownames(pathway_table)))
+
+# Clean sample column names (remove _Abundance-RELAB etc.)
+colnames(pathway_table_filtered) <- gsub("_.*$", "", colnames(pathway_table_filtered))
+
+# Build joined object (metadata + pathways)
+pathway_transposed       <- t(pathway_table_filtered)      # samples x pathways
+pathway_df               <- as.data.frame(pathway_transposed)
+pathway_df$SampleID      <- rownames(pathway_df)
+metadata$SampleID        <- rownames(metadata)
+
+# Inner join on SampleID to keep only matched samples
+joined_df <- merge(metadata, pathway_df, by = "SampleID")
+rownames(joined_df) <- joined_df$SampleID
+
+# Extract numeric pathway matrix only (samples x pathways)
+pathway_data <- joined_df[, !(names(joined_df) %in% names(metadata)), drop = FALSE]
+
+# Sanity checks
+dim(pathway_data)                 # samples x pathways
+sum(rowSums(pathway_data) == 0)   # should be 0
+
+# Keep consistent sample set / drop NA Batch
+stopifnot(identical(rownames(joined_df), rownames(pathway_data)))
+
+keep            <- !is.na(joined_df$Batch)
+pathway_use     <- pathway_data[keep, , drop = FALSE]
+joined_use      <- droplevels(joined_df[keep, , drop = FALSE])
+
+# NMDS (Bray–Curtis)
+set.seed(42)
+nmds_result <- metaMDS(
+pathway_use,
+distance      = "bray",
+k             = 2,
+trymax        = 100,
+autotransform = FALSE
+)
+
+nmds_scores <- as.data.frame(scores(nmds_result, display = "sites"))
+nmds_scores$SampleID <- rownames(nmds_scores)
+nmds_scores$Batch    <- factor(joined_use[nmds_scores$SampleID, "Batch"])
+
+#nPERMANOVA on the same Bray–Curtis distance
+
+dist_bray <- vegdist(pathway_use, method = "bray")
+
+ado      <- adonis2(dist_bray ~ Batch, data = joined_use, permutations = 999)
+R2_batch <- round(ado$R2[1], 3)
+p_batch  <- format.pval(ado$`Pr(>F)`[1], digits = 3)
+
+annot_text <- paste0(
+"Stress = ", round(nmds_result$stress, 2),
+" | PERMANOVA: R² = ", R2_batch, ", p = ", p_batch
+)
+
+# Aesthetics (same colours / labels as before)
+my_colours <- c(
+"Italy"  = "#E64B35FF",
+"Segata" = "#00A087FF",
+"Adugna" = "#3C5488FF"
+)
+
+legend_labels <- c(
+"Italy"  = "Italy",
+"Segata" = "Ethiopia (rural)",
+"Adugna" = "Ethiopia (urban)"
+)
+
+# Plot NMDS + annotation
+nmdsbray_pathway <-
+ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, colour = Batch, fill = Batch)) +
+stat_ellipse(geom = "polygon", alpha = 0.2, show.legend = FALSE) +
+geom_point(aes(fill = Batch),
+colour = "black",
+shape  = 21,
+size   = 3,
+stroke = 0.4) +
+labs(
+title  = "NMDS of Pathway-Based Bray–Curtis Dissimilarity",
+x      = "NMDS1",
+y      = "NMDS2",
+colour = "Batch",
+fill   = "Batch"
+) +
+annotate(
+"text",
+x      = min(nmds_scores$NMDS1),
+y      = max(nmds_scores$NMDS2),
+label  = annot_text,
+hjust  = -0.01,
+vjust  = -0.8,
+size   = 4.8
+) +
+scale_colour_manual(values = my_colours, labels = legend_labels) +
+scale_fill_manual(values  = my_colours, labels = legend_labels) +
+theme_prism() +
+coord_cartesian(clip = "off") +
+theme(
+plot.title    = element_text(hjust = 0.5, face = "bold", size = 16),
+legend.position = "right",
+legend.text   = element_text(size = 14)
+)
+
+print(nmdsbray_pathway)
+
+# Save to PDF
+ggsave(
+filename = "/path/to/your/data/ITALY/REVISION/NMDS_plot_pathway.pdf",
+plot     = nmdsbray_pathway,
+width    = 7,
+height   = 5,
+useDingbats = FALSE
+)
+
+# Export NMDS coordinates + metadata to Excel
+# library(writexl)
+# joined_use_df <- joined_use %>% as.data.frame() %>% select(-Batch)
+# nmds_export <- nmds_scores %>%
+# left_join(joined_use_df, by = "SampleID") %>%
+# select(SampleID, NMDS1, NMDS2, Batch, everything())
+# write_xlsx(
+# nmds_export,
+# "/path/to/your/data/ITALY/REVISION/NMDS_pathways_BrayCurtis_REVISION.xlsx"
+# )
+
+```
+
+#### Species
+```{r}
+# NMDS on MetaPhlAn species table (Bray–Curtis)
+# PERMANOVA on Batch
+
+# Load metadata and MetaPhlAn table
+metadata <- read.csv(
+"/path/to/your/data/ITALY/MaAsLin3_ITALY/250410_metadata_Adugna_Segata_Italy.txt",
+sep       = "\t",
+row.names = 1,
+check.names = FALSE
+)
+
+taxa.metaphlan <- read.csv(
+"/path/to/your/data/ITALY/MaAsLin3_ITALY/Adugna_Segata_ITALY_merged_metaphlan.txt",
+sep       = "\t",
+row.names = 1,
+check.names = FALSE
+)
+
+# Species-level table (no strains), samples x species
+speciestable <- taxa.metaphlan[grep("\|s__", rownames(taxa.metaphlan)), , drop = FALSE]
+speciestable <- speciestable[grep("\|t__", rownames(speciestable), invert = TRUE), , drop = FALSE]
+
+species_t <- as.data.frame(t(speciestable))   # samples x species
+species_t[] <- lapply(species_t, function(x) as.numeric(as.character(x)))
+
+species_t$SampleID <- rownames(species_t)
+metadata$SampleID  <- rownames(metadata)
+
+# Merge metadata + species
+joined_df <- merge(metadata, species_t, by = "SampleID")
+rownames(joined_df) <- joined_df$SampleID
+
+# Feature matrix (samples x species)
+species_data <- joined_df[, !(names(joined_df) %in% names(metadata)), drop = FALSE]
+
+# Sanity checks
+dim(species_data)                 # samples x species
+sum(rowSums(species_data) == 0)   # should be 0
+
+# Keep consistent set / drop NA Batch
+
+stopifnot(identical(rownames(joined_df), rownames(species_data)))
+
+keep        <- !is.na(joined_df$Batch)
+species_use <- species_data[keep, , drop = FALSE]
+joined_use  <- droplevels(joined_df[keep, , drop = FALSE])
+
+# NMDS (Bray–Curtis)
+
+set.seed(42)
+nmds_result <- metaMDS(
+species_use,
+distance      = "bray",
+k             = 2,
+trymax        = 100,
+autotransform = FALSE
+)
+
+nmds_scores <- as.data.frame(scores(nmds_result, display = "sites"))
+nmds_scores$SampleID <- rownames(nmds_scores)
+nmds_scores$Batch    <- factor(joined_use[nmds_scores$SampleID, "Batch"])
+
+# PERMANOVA on same Bray–Curtis distance
+
+dist_bray <- vegdist(species_use, method = "bray")
+ado       <- adonis2(dist_bray ~ Batch, data = joined_use, permutations = 999)
+R2_batch  <- round(ado$R2[1], 3)
+p_batch   <- format.pval(ado$`Pr(>F)`[1], digits = 3)
+
+annot_text <- paste0(
+"Stress = ", round(nmds_result$stress, 2),
+" | PERMANOVA: R² = ", R2_batch, ", p = ", p_batch
+)
+
+# Aesthetics (match pathway plot)
+
+my_colours <- c(
+"Italy"  = "#E64B35FF",
+"Segata" = "#00A087FF",
+"Adugna" = "#3C5488FF"
+)
+
+legend_labels <- c(
+"Italy"  = "Italy",
+"Segata" = "Ethiopia (rural)",
+"Adugna" = "Ethiopia (urban)"
+)
+
+# Plot NMDS
+
+nmdsbray_species <-
+ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, colour = Batch, fill = Batch)) +
+stat_ellipse(geom = "polygon", alpha = 0.2, show.legend = FALSE) +
+geom_point(aes(fill = Batch),
+colour = "black",
+shape  = 21,
+size   = 3,
+stroke = 0.4) +
+labs(
+title  = "NMDS of Species-Based Bray–Curtis Dissimilarity",
+x      = "NMDS1",
+y      = "NMDS2",
+colour = "Batch",
+fill   = "Batch"
+) +
+annotate(
+"text",
+x      = min(nmds_scores$NMDS1),
+y      = max(nmds_scores$NMDS2),
+label  = annot_text,
+hjust  = -0.01,
+vjust  = -0.8,
+size   = 4.8
+) +
+scale_colour_manual(values = my_colours, labels = legend_labels) +
+scale_fill_manual(values  = my_colours, labels = legend_labels) +
+theme_prism() +
+coord_cartesian(clip = "off") +
+theme(
+plot.title    = element_text(hjust = 0.5, face = "bold", size = 16),
+legend.position = "right",
+legend.text   = element_text(size = 14)
+)
+
+print(nmdsbray_species)
+
+# Save to PDF
+
+ggsave(
+filename = "/path/to/your/data/ITALY/REVISION/NMDS_plot_species.pdf",
+plot     = nmdsbray_species,
+width    = 7,
+height   = 5,
+useDingbats = FALSE
+)
+
+# Export NMDS coordinates + metadata to Excel
+# joined_use_df <- joined_use %>% as.data.frame() %>% select(-Batch)
+# nmds_species_export <- nmds_scores %>%
+# left_join(joined_use_df, by = "SampleID") %>%
+# select(SampleID, NMDS1, NMDS2, Batch, everything())
+# write_xlsx(
+# nmds_species_export,
+# "/path/to/your/data/ITALY/REVISION/NMDS_species_BrayCurtis_REVISION.xlsx"
+# )
+
+```
+
+### RGI Analysis Urban, Rural, Italy
+```{r fig.width=20, fig.height=10}
+# Paths (edit if needed)
+path_urban <- "/path/to/your/data/RGI/combined_amr_results.csv"
+path_rural <- "/path/to/your/data/RGI/RGI_results_rural/combined_amr_results.csv"
+path_italy <- "/path/to/your/data/RGI/RGI_results_Italy/combined_amr_results_SAMN.csv"
+metadata_path <- "/path/to/your/data/ITALY/MaAsLin3_ITALY/250410_metadata_Adugna_Segata_Italy.xlsx"
+
+# Read RGI data
+rgi_data_urban <- read_csv(path_urban, show_col_types = FALSE)
+rgi_data_rural <- read_csv(path_rural, show_col_types = FALSE)
+rgi_data_italy <- read_csv(path_italy, show_col_types = FALSE)
+
+# Filter & tag origin
+filtered_urban <- rgi_data_urban %>%
+  filter(num_reads >= 100, read_coverage_breadth >= 80) %>%
+  mutate(origin = "urban")
+
+filtered_rural <- rgi_data_rural %>%
+  filter(num_reads >= 100, read_coverage_breadth >= 80) %>%
+  mutate(origin = "rural")
+
+filtered_italy <- rgi_data_italy %>%
+  filter(num_reads >= 100, read_coverage_breadth >= 80) %>%
+  mutate(origin = "italy")
+
+filtered_rgi_all <- bind_rows(filtered_urban, filtered_rural, filtered_italy)
+
+# Metadata attach
+metadata <- read_excel(metadata_path)
+
+annotated_rgi_all <- filtered_rgi_all %>%
+  left_join(metadata, by = c("sample_name" = "SampleID"))
+
+## Sanity: check non-matched samples
+anti_join(filtered_rgi_all, metadata, by = c("sample_name" = "SampleID")) %>% print(n = 50)
+
+# #Export as excel
+# write.xlsx(annotated_rgi_all, "/path/to/your/data/RGI/RGI_results_Italy/RGI_annotated_all_samples-REVISION.xlsx")
+
+# Canonicalise drug-class sets (Because we have multiple ones that are the same in different orders)
+# trims, de-duplicates, sorts tokens so that
+# "A; B; C" == "C; A; B"
+canon_set <- function(x) {
+  x %>%
+    str_split(";") %>%
+    map(~ .x %>%
+          str_trim() %>%
+          tolower() %>%        # normalise case for matching
+          unique() %>%
+          sort()
+    ) %>%
+    map_chr(~ paste(.x, collapse = "; "))
+}
+
+annotated_rgi_all <- annotated_rgi_all %>%
+  mutate(
+    high_level_drug_class = case_when(
+      is.na(high_level_drug_class) ~ NA_character_,
+      TRUE ~ canon_set(high_level_drug_class)
+    ),
+    # Keep an explicit label for missing classes (optional; remove if you prefer to drop)
+    high_level_drug_class = replace_na(high_level_drug_class, "unclassified")
+  )
+
+# Count & derive Top 10 per origin (+ Others)
+drug_counts <- annotated_rgi_all %>%
+  count(origin, high_level_drug_class, name = "count")
+
+top_classes_by_origin <- drug_counts %>%
+  group_by(origin) %>%
+  slice_max(order_by = count, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+drug_counts_grouped <- drug_counts %>%
+  left_join(
+    top_classes_by_origin %>%
+      dplyr::select(origin, high_level_drug_class) %>%
+      mutate(is_top = TRUE),
+    by = c("origin", "high_level_drug_class")
+  ) %>%
+  mutate(is_top = if_else(is.na(is_top), FALSE, is_top),
+         class_group = if_else(is_top, high_level_drug_class, "Others")) %>%
+  group_by(origin, class_group) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Clean up labels (user-specific recode)
+# Shorten teh very long lable for plotting
+drug_counts_grouped <- drug_counts_grouped %>%
+  mutate(
+    class_group = case_when(
+      class_group == "beta-lactam antibiotic; disinfecting agents and antiseptics; fluoroquinolone antibiotic; phenicol antibiotic; rifamycin antibiotic; tetracycline antibiotic" ~
+        "disinfecting agents and antiseptics; multiple antibiotics",
+      TRUE ~ class_group
+    )
+  )
+
+# Pretty origin labels
+drug_counts_grouped <- drug_counts_grouped %>%
+  mutate(
+    origin = case_when(
+      origin == "urban" ~ "Ethiopia (urban)",
+      origin == "rural" ~ "Ethiopia (rural)",
+      origin == "italy" ~ "Italy",
+      TRUE ~ origin
+    )
+  )
+
+# Legend order: by total count across all origins,with "Others" last.
+legend_order <- drug_counts_grouped %>%
+  group_by(class_group) %>%
+  summarise(total = sum(count), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(class_group)
+
+legend_order <- c(setdiff(legend_order, "Others"), "Others")
+
+drug_counts_grouped <- drug_counts_grouped %>%
+  mutate(class_group = factor(class_group, levels = legend_order))
+
+
+# Fractions per origin for pies
+drug_counts_grouped <- drug_counts_grouped %>%
+  group_by(origin) %>%
+  mutate(
+    fraction = count / sum(count),
+    ypos = cumsum(fraction) - 0.5 * fraction
+  ) %>%
+  ungroup()
+
+# Colors (expand if needed)
+palette_colours <- as.character(paletteer_d("ggthemes::Tableau_20"))
+all_class_groups <- levels(drug_counts_grouped$class_group)
+
+# ensure enough colours; reserve a neutral for "Others"
+base_cols <- rep_len(palette_colours, length(all_class_groups))
+names(base_cols) <- all_class_groups
+if ("Others" %in% names(base_cols)) base_cols["Others"] <- "#CCCCCC"  # light grey
+
+# Plot
+drugplot <- ggplot(drug_counts_grouped, aes(x = "", y = fraction, fill = class_group)) +
+  geom_col(width = 1, colour = "white") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ origin) +
+  scale_fill_manual(values = base_cols, breaks = all_class_groups) +
+  labs(title = "Top 10 AMR Drug Classes per Origin (Others Grouped)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    strip.text = element_text(face = "bold", size = 20, margin = margin(b = 4)),
+    legend.text = element_text(size = 18, face = "plain"),
+    legend.title = element_blank(),
+    legend.position = "right",
+    legend.justification = "centre",
+    legend.box.just = "centre",
+    # transparent background
+    panel.background = element_rect(fill = NA, colour = NA),
+    plot.background  = element_rect(fill = NA, colour = NA)
+  ) +
+  guides(fill = guide_legend(ncol = 1, byrow = TRUE))
+
+print(drugplot)
+
+# ggsave("/path/to/your/data/RGI/RGI_results_Italy/RGI_drug_classesREVISION2.png", drugplot, width = 20, height = 10, dpi = 300)
+
+
+# Pie charts fpr AMR genes
+# Count genes per origin
+gene_counts <- annotated_rgi_all %>%
+  count(origin, gene_name, name = "count")
+
+# Top 10 genes per origin
+top_genes_by_origin <- gene_counts %>%
+  group_by(origin) %>%
+  slice_max(order_by = count, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# Group non-top genes into "Others"
+gene_counts_grouped <- gene_counts %>%
+  left_join(
+    top_genes_by_origin %>%
+      select(origin, gene_name) %>%
+      mutate(is_top = TRUE),
+    by = c("origin", "gene_name")
+  ) %>%
+  mutate(
+    is_top    = if_else(is.na(is_top), FALSE, is_top),
+    gene_group = if_else(is_top, gene_name, "Others")
+  ) %>%
+  group_by(origin, gene_group) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Fractions per origin for pies
+gene_counts_grouped <- gene_counts_grouped %>%
+  group_by(origin) %>%
+  mutate(
+    fraction = count / sum(count)
+  ) %>%
+  ungroup()
+
+# Make gene_group a factor and ensure "Others" is last
+gene_counts_grouped <- gene_counts_grouped %>%
+  mutate(
+    gene_group = factor(gene_group) %>%
+      fct_relevel("Others", after = Inf)
+  )
+
+# Pretty origin labels (same as for drug classes)
+gene_counts_grouped <- gene_counts_grouped %>%
+  mutate(
+    origin = case_when(
+      origin == "urban" ~ "Ethiopia (urban)",
+      origin == "rural" ~ "Ethiopia (rural)",
+      origin == "italy" ~ "Italy",
+      TRUE ~ origin
+    )
+  )
+
+# Colourblind-safe palette mapped to current gene groups
+all_gene_groups <- levels(gene_counts_grouped$gene_group)
+palette_colours  <- as.character(paletteer_d("ggthemes::Tableau_20"))
+colour_map <- setNames(palette_colours[1:length(all_gene_groups)], all_gene_groups)
+
+# Gene pie plot
+geneplot <- ggplot(gene_counts_grouped, aes(x = "", y = fraction, fill = gene_group)) +
+  geom_col(width = 1, colour = "white") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ origin) +
+  scale_fill_manual(values = colour_map, breaks = all_gene_groups) +
+  theme_void() +
+  labs(title = "Top 10 AMR Genes per Origin (Others Grouped)") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    strip.text = element_text(face = "bold", size = 16),
+    legend.text = element_text(size = 14),
+    legend.title = element_blank()
+  )
+
+print(geneplot)
+
+# Save to PDF
+ggsave(
+  "/path/to/your/data/RGI/RGI_results_Italy/AMR_genes_pies.pdf",
+  plot   = geneplot,
+  width  = 20,
+  height = 10
+)
+
+
+```
+
+---
+
+# Session Information
+## Detailed Session Information
+
+### System Information
+```
+Platform: x86_64-pc-linux-gnu
+Operating System: Debian GNU/Linux 12 (bookworm)
+Kernel: Linux 6.12.33+deb12-amd64
+```
+
+### Software Module Versions (via lmod)
+
+**Key modules used in this pipeline:**
+
+Quality Control:
+- FastQC v0.12.1
+
+Aligners:
+- Bowtie2 v2.5.3 (64-bit)
+
+Assembly:
+- SPAdes v3.15.5 (metaSPAdes mode)
+
+Tools:
+- samtools v1.20 (with htslib 1.20)
+- MetaBAT v2.12.1 (version 2:GIT-NOTFOUND; 2020-09-08)
+- Prodigal V2.6.3 (February 2016)
+- HMMER v3.4
+
+### Conda Environment Versions
+
+**gi_metaphlan environment:**
+- MetaPhlAn v4.1.1
+- HUMAnN v3.9
+
+**gi_eggnog-mapper2.1.12 environment:**
+- eggnog-mapper v2.1.12
+
+**gi_qiime2-amplicon-2025.7 environment:**
+- QIIME2 2025.7 amplicon distribution
+
+**Other available environments:**
+- checkm v1.2.2 (various environments)
+- phylophlan v3.1.68 (available in metaphlan environment)
+
+### Available Module Categories
+
+**Aligners:** BWA (0.7.18), Bismark (0.24.2), Bowtie (1.3.1), Bowtie2 (2.5.4), 
+HISAT2 (2.2.1), STAR (2.7.11b), kallisto (0.51.1), minimap2 (2.28)
+
+**Assembly Tools:** Canu (2.2), SPAdes (4.0.0), Unicycler (0.5.0), 
+hifiasm (0.25.0), megahit (1.2.9)
+
+**QC Tools:** FastQC (0.12.1), FastQScreen (0.14.1), Qualimap (2.3.0), 
+QUAST (5.3.0), Trimmomatic (0.39), fastp (0.23.4)
+
+**Analysis Tools:** BEDTools (2.31.1), bcftools (1.20), samtools (1.20), 
+MetaBAT (2.12.1), Kraken2 (2.1.3), Prodigal (2.6.3)
+
+### R Session Information
+
+Analysis performed using R version 4.5.0 (2025-04-11)
+
+```
+R version 4.5.0 (2025-04-11)
+Platform: x86_64-pc-linux-gnu
+Running under: Debian GNU/Linux 12 (bookworm)
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/blas/libblas.so.3.11.0
+LAPACK: /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3.11.0
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C
+ [3] LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8
+ [5] LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8
+ [7] LC_PAPER=en_US.UTF-8       LC_NAME=C
+ [9] LC_ADDRESS=C               LC_TELEPHONE=C
+[11] LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C
+
+time zone: Europe/Zurich
+tzcode source: system (glibc)
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base
+
+other attached packages:
+ [1] fs_1.6.5            tidyverse_2.0.0     ggplot2_4.0.0
+ [4] dplyr_1.1.4         readr_2.1.5         tidyr_1.3.1
+ [7] stringr_1.5.2       purrr_1.1.0         tibble_3.3.0
+[10] lubridate_1.9.4
+
+loaded via a namespace (and not attached):
+ [1] vctrs_0.6.5       cli_3.6.5         rlang_1.1.6
+ [4] glue_1.8.0        lifecycle_1.0.4   generics_0.1.4
+ [7] hms_1.1.3         pillar_1.11.1     tzdb_0.5.0
+[10] fansi_1.0.6       scales_1.4.0      magrittr_2.0.4
+[13] utf8_1.2.4        withr_3.0.2       timechange_0.3.0
+[16] gtable_0.3.6      munsell_0.5.1     pkgconfig_2.0.3
+[19] colorspace_2.1-1  tidyselect_1.2.1  compiler_4.5.0
+```
+
+### Python Environment Information (via conda)
+
+MetaPhlAn/HUMAnN environment (gi_metaphlan):
+```
+Python 3.10 (exact version determined by conda environment)
+Key packages:
+- metaphlan 4.1.1
+- humann 3.9
+- numpy, scipy, pandas (versions managed by conda)
+```
+
+eggNOG-mapper environment (gi_eggnog-mapper2.1.12):
+```
+Python 3.x (exact version determined by conda environment)
+Key packages:
+- eggnog-mapper 2.1.12
+- diamond (for protein alignment)
+```
+
+### Pipeline-Specific Software
+
+**PhyloPhlAn:**
+- Version: Latest compatible with MetaPhlAn 4.1.1
+- Database: SGB.Jun23
+
+**CheckM:**
+- Version: 1.2.1
+- Used for MAG quality assessment
+
+**Reference Databases:**
+- Human genome: GRCh38_noalt_as (for host contamination removal)
+- MetaPhlAn: mpa_vJan21_CHOCOPhlAnSGB_202103 (or latest)
+- HUMAnN: UniRef90, MetaCyc databases
+
+### Analysis Date
+Pipeline executed: 2025
+Documentation prepared: 2026-01-12
